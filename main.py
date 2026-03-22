@@ -1,185 +1,90 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import cv2
-import numpy as np
-from ultralytics import YOLO
-import io
+import argparse
+import json
 import os
-import joblib
-import numpy as np
+from pathlib import Path
 
-app = FastAPI()
-person_model = None
-pose_model = None
-bodytype_model = None
-label_encoder = None
+import cv2
+import os
 
-# CORS for Android app
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "https://your-android-app-domain"],  # Update with Android app domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
-# Pydantic model for body type prediction
-class BodyMetrics(BaseModel):
-    Gender: float
-    Age: float
-    ShoulderWidth: float
-    ChestWidth: float
-    Belly: float
-    Waist: float
-    Hips: float
-    ArmLength: float
-    ShoulderToWaist: float
-    WaistToKnee: float
-    LegLength: float
-    TotalHeight: float
-    BodyFatPercentage: float
+ROOT = Path(__file__).resolve().parent
 
-# Map Western body types to Ayurvedic
-def map_to_ayurvedic(bodytype):
-    mapping = {
-        "Ectomorph": "Vata",
-        "Mesomorph": "Pitta",
-        "Endomorph": "Kapha"
-    }
-    return mapping.get(bodytype, "Unknown")
 
-@app.get("/healthz")
-async def health_check():
-    print("Health check hit!")
-    return {"status": "healthy"}
+def _resolve_image_path(path_str: str) -> Path:
+    """Resolve image path and support .jpg -> .jpeg fallback for defaults."""
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = ROOT / path
 
-@app.post("/detect/")
-async def detect_measurements(file: UploadFile = File(...), age: float = Form(...), gender: float = Form(...)):
-    global person_model, pose_model, bodytype_model, label_encoder
-    if person_model is None:
-        print("Loading person model...")
-        person_model = YOLO("yolov8n.pt")
-    if pose_model is None:
-        print("Loading pose model...")
-        pose_model = YOLO("yolov8n-pose.pt")
-    if bodytype_model is None:
-        print("Loading body type model...")
-        bodytype_model = joblib.load("bodytype_model.pkl")
-    if label_encoder is None:
-        print("Loading label encoder...")
-        label_encoder = joblib.load("label_encoder.pkl")
-    
-    print(f"Received file: {file.filename}, age: {age}, gender: {gender}")
-    contents = await file.read()
-    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if path.exists():
+        return path
 
-    # A4 detection
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    a4_height_pixels = None
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect_ratio = h / float(w)
-        if 1.3 < aspect_ratio < 1.5 and 400 < h < 700 and y < img.shape[0] * 0.6:
-            a4_height_pixels = h
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            print(f"A4 detected: height_pixels={h}, aspect_ratio={aspect_ratio}")
-            break
+    # Keep user-requested defaults while supporting existing test assets.
+    if path.suffix.lower() == ".jpg":
+        jpeg_path = path.with_suffix(".jpeg")
+        if jpeg_path.exists():
+            return jpeg_path
 
-    if not a4_height_pixels:
-        print(f"No A4 detected! Contours checked: {len(contours)}")
-        return {"error": "A4 not detected!"}
+    raise FileNotFoundError(f"Image not found: {path}")
 
-    scale_factor = 29.7 / a4_height_pixels
-    print(f"Scale factor: {scale_factor}")
 
-    # Person detection
-    results = person_model(img)
-    person_bbox = None
-    for r in results:
-        for box in r.boxes.xyxy:
-            x1, y1, x2, y2 = map(int, box[:4])
-            person_bbox = (x1, y1, x2, y2)
-            bbox_height = y2 - y1
-            total_height_in = round(bbox_height * scale_factor * 0.393701, 2)  # Convert cm to inches
-            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(
-                img,
-                f"Height: {total_height_in:.2f} in",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 0, 0),
-                2,
-            )
-            break
+def _load_image(path: Path):
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Failed to load image: {path}")
+    return image
 
-    if person_bbox is None:
-        return {"error": "Person not detected!"}
 
-    # Pose estimation
-    pose_results = pose_model(img)
+def run_pipeline(front_image_path: str, side_image_path: str, age: float, gender: float, height: float):
+    """Run the body measurement pipeline and return API-compatible output."""
+    from models.model_loader import ModelLoader
+    from pipeline.measurement_pipeline import MeasurementPipeline
 
-    def dist(p1, p2):
-        return np.linalg.norm(np.array(p1) - np.array(p2)) * scale_factor * 0.393701  # Convert to inches
+    front_path = _resolve_image_path(front_image_path)
+    side_path = _resolve_image_path(side_image_path)
 
-    for r in pose_results:
-        keypoints = r.keypoints.xy.cpu().numpy()[0]
-        ls, rs = keypoints[5], keypoints[6]  # shoulders
-        lh, rh = keypoints[11], keypoints[12]  # hips
-        le, re = keypoints[7], keypoints[8]  # elbows
-        lw, rw = keypoints[9], keypoints[10]  # wrists
-        lk, rk = keypoints[13], keypoints[14]  # knees
-        la, ra = keypoints[15], keypoints[16]  # ankles
+    front_img = _load_image(front_path)
+    side_img = _load_image(side_path)
 
-        ShoulderWidth = round(float(dist(ls, rs)), 2)
-        ChestWidth = round(float(ShoulderWidth * 0.9), 2)
-        Waist = round(float(dist(lh, rh)), 2)
-        Hips = round(float(Waist * 1.05), 2)
-        ArmLength = round(float(max(dist(ls, lw), dist(rs, rw))), 2)
-        ShoulderToWaist = round(float(np.mean([dist(ls, lh), dist(rs, rh)])), 2)
-        WaistToKnee = round(float(np.mean([dist(lh, lk), dist(rh, rk)])), 2)
-        LegLength = round(float(np.mean([dist(lh, la), dist(rh, ra)])), 2)
-        Belly = round(float(Waist * 1.1), 2)  # Placeholder
-        BodyFatPercentage = round(float(64 - (20 * Waist / total_height_in)), 2)
-        print(f"Keypoints: ls={ls}, rs={rs}, lh={lh}, rh={rh}")
+    models = ModelLoader().load_models()
+    pipeline = MeasurementPipeline(models)
 
-        # Prepare body metrics for prediction
-        body_metrics = np.array([[
-            gender, age, ShoulderWidth, ChestWidth, Belly, Waist, Hips,
-            ArmLength, ShoulderToWaist, WaistToKnee, LegLength, total_height_in, BodyFatPercentage
-        ]])
-        print(f"Body metrics: {body_metrics}")
+    return pipeline.run(
+        front_image=front_img,
+        side_image=side_img,
+        age=age,
+        gender=gender,
+        height=height,
+    )
 
-        # Predict body type
-        prediction = bodytype_model.predict(body_metrics)
-        predicted_label = label_encoder.inverse_transform(prediction)[0]
-        ayurvedic_type = map_to_ayurvedic(predicted_label)
 
-        params = {
-            "Gender": gender,
-            "Age": age,
-            "ShoulderWidth_in": ShoulderWidth,
-            "ChestWidth_in": ChestWidth,
-            "Waist_in": Waist,
-            "Hips_in": Hips,
-            "ArmLength_in": ArmLength,
-            "ShoulderToWaist_in": ShoulderToWaist,
-            "WaistToKnee_in": WaistToKnee,
-            "LegLength_in": LegLength,
-            "TotalHeight_in": total_height_in,
-            "Belly_in": Belly,
-            "BodyFatPercentage": BodyFatPercentage,
-            "body_type": predicted_label,
-            "ayurvedic_type": ayurvedic_type
-        }
-        return params
+def parse_args():
+    parser = argparse.ArgumentParser(description="Body measurement pipeline CLI")
+    parser.add_argument("--front-image", default="test/front1.jpg", help="Front image path")
+    parser.add_argument("--side-image", default="test/side1.jpg", help="Side image path")
+    parser.add_argument("--gender", type=float, default=1, help="Gender (0 or 1)")
+    parser.add_argument("--age", type=float, default=20, help="Age in years")
+    parser.add_argument("--height", type=float, default=174, help="Total height in centimeters")
+    parser.add_argument("--debug-vis", type=int, choices=[0, 1], default=1, help="Save debug visualizations (1=on, 0=off)")
+    return parser.parse_args()
 
-    return {"error": "No pose data detected!"}
+
+def main():
+    from utils.debug_visualization import clear_debug_folder
+
+    args = parse_args()
+    os.environ["BODY_DEBUG_VIS"] = str(args.debug_vis)
+    clear_debug_folder()
+    result = run_pipeline(
+        front_image_path=args.front_image,
+        side_image_path=args.side_image,
+        age=args.age,
+        gender=args.gender,
+        height=args.height,
+    )
+    print(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()

@@ -1,0 +1,1443 @@
+================================================================================
+PROJECT EXTRACTION REPORT
+================================================================================
+
+PROJECT STRUCTURE:
+--------------------------------------------------------------------------------
+
+body-measurement-api/
+├── README.md
+├── bodytype_model.pkl
+├── label_encoder.pkl
+├── main.py
+├── project_extract.py
+├── project_extraction.txt
+├── requirements.txt
+├── test.py
+├── tmp_smoke_test.py
+├── yolov8n-pose.pt
+├── yolov8n.pt
+├── api/
+├── debug/
+│   ├── front_mask_overlay.png
+│   ├── front_person_detection.png
+│   ├── front_pose.png
+│   ├── front_segmentation_mask.png
+│   ├── front_segmentation_with_bbox.png
+│   ├── front_torso_rows.png
+│   ├── front_width_profile.png
+│   ├── side_mask_overlay.png
+│   ├── side_person_detection.png
+│   ├── side_pose.png
+│   ├── side_segmentation_mask.png
+│   └── side_segmentation_with_bbox.png
+├── docs/
+│   ├── Body Measurement System V2 Architecture.docx
+│   └── LLM IMPLEMENTATION SPECIFICATION.docx
+├── measurement/
+│   ├── depth_estimation.py
+│   ├── feature_scaling.py
+│   ├── height_measurement.py
+│   ├── limb_measurements.py
+│   └── torso_measurements.py
+├── models/
+│   └── model_loader.py
+├── old/
+│   └── Dockerfile
+├── pipeline/
+│   └── measurement_pipeline.py
+├── test/
+│   ├── front1.jpeg
+│   ├── front2.jpeg
+│   ├── front3.jpeg
+│   ├── front4.jpeg
+│   ├── side1.jpeg
+│   ├── side2.jpeg
+│   ├── side3.jpeg
+│   └── side4.jpeg
+├── utils/
+│   ├── debug_visualization.py
+│   ├── image_utils.py
+│   └── stabilization.py
+└── vision/
+    ├── detection.py
+    ├── pose.py
+    └── segmentation.py
+
+
+================================================================================
+FILE CONTENTS
+================================================================================
+
+
+================================================================================
+FILE: main.py
+================================================================================
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import cv2
+import os
+
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_image_path(path_str: str) -> Path:
+    """Resolve image path and support .jpg -> .jpeg fallback for defaults."""
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = ROOT / path
+
+    if path.exists():
+        return path
+
+    # Keep user-requested defaults while supporting existing test assets.
+    if path.suffix.lower() == ".jpg":
+        jpeg_path = path.with_suffix(".jpeg")
+        if jpeg_path.exists():
+            return jpeg_path
+
+    raise FileNotFoundError(f"Image not found: {path}")
+
+
+def _load_image(path: Path):
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Failed to load image: {path}")
+    return image
+
+
+def run_pipeline(front_image_path: str, side_image_path: str, age: float, gender: float, height: float):
+    """Run the body measurement pipeline and return API-compatible output."""
+    from models.model_loader import ModelLoader
+    from pipeline.measurement_pipeline import MeasurementPipeline
+
+    front_path = _resolve_image_path(front_image_path)
+    side_path = _resolve_image_path(side_image_path)
+
+    front_img = _load_image(front_path)
+    side_img = _load_image(side_path)
+
+    models = ModelLoader().load_models()
+    pipeline = MeasurementPipeline(models)
+
+    return pipeline.run(
+        front_image=front_img,
+        side_image=side_img,
+        age=age,
+        gender=gender,
+        height=height,
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Body measurement pipeline CLI")
+    parser.add_argument("--front-image", default="test/front1.jpg", help="Front image path")
+    parser.add_argument("--side-image", default="test/side1.jpg", help="Side image path")
+    parser.add_argument("--gender", type=float, default=1, help="Gender (0 or 1)")
+    parser.add_argument("--age", type=float, default=20, help="Age in years")
+    parser.add_argument("--height", type=float, default=174, help="Total height in centimeters")
+    parser.add_argument("--debug-vis", type=int, choices=[0, 1], default=1, help="Save debug visualizations (1=on, 0=off)")
+    return parser.parse_args()
+
+
+def main():
+    from utils.debug_visualization import clear_debug_folder
+
+    args = parse_args()
+    os.environ["BODY_DEBUG_VIS"] = str(args.debug_vis)
+    clear_debug_folder()
+    result = run_pipeline(
+        front_image_path=args.front_image,
+        side_image_path=args.side_image,
+        age=args.age,
+        gender=args.gender,
+        height=args.height,
+    )
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: measurement/depth_estimation.py
+================================================================================
+
+import numpy as np
+import math
+
+
+def compute_depth_profile(mask):
+    """
+    Compute body depth profile from side silhouette mask.
+    """
+
+    height = mask.shape[0]
+
+    depths = []
+
+    for y in range(height):
+
+        row = mask[y]
+
+        body_pixels = np.where(row == 1)[0]
+
+        if len(body_pixels) == 0:
+            depths.append(0)
+            continue
+
+        left = body_pixels[0]
+        right = body_pixels[-1]
+
+        depths.append(right - left)
+
+    return np.array(depths)
+
+
+def compute_torso_depths(side_mask, chest_y, waist_y, hip_y):
+
+    depth_profile = compute_depth_profile(side_mask)
+
+    chest_depth = depth_profile[chest_y]
+    waist_depth = depth_profile[waist_y]
+    hip_depth = depth_profile[hip_y]
+
+    return {
+        "chest_depth_pixels": chest_depth,
+        "waist_depth_pixels": waist_depth,
+        "hip_depth_pixels": hip_depth
+    }
+
+
+def ellipse_circumference(width, depth):
+
+    a = width / 2
+    b = depth / 2
+
+    C = math.pi * (3*(a+b) - math.sqrt((3*a + b)*(a + 3*b)))
+
+    return C
+
+
+def compute_torso_circumferences(widths, depths):
+
+    chest = ellipse_circumference(
+        widths["chest_width_pixels"],
+        depths["chest_depth_pixels"]
+    )
+
+    waist = ellipse_circumference(
+        widths["waist_width_pixels"],
+        depths["waist_depth_pixels"]
+    )
+
+    hips = ellipse_circumference(
+        widths["hip_width_pixels"],
+        depths["hip_depth_pixels"]
+    )
+
+    return {
+        "chest_pixels": chest,
+        "waist_pixels": waist,
+        "hips_pixels": hips
+    }
+
+
+================================================================================
+FILE: measurement/feature_scaling.py
+================================================================================
+
+def compute_scale(real_height, pixel_height):
+    """
+    Compute pixel-to-real-world scaling factor.
+    """
+
+    if pixel_height == 0:
+        raise ValueError("Pixel height cannot be zero")
+
+    scale = real_height / pixel_height
+
+    return scale
+
+
+def scale_measurements(measurements, scale):
+
+    scaled = {}
+
+    for key, value in measurements.items():
+        scaled[key] = value * scale
+
+    return scaled
+
+
+def compute_body_fat(waist, height):
+
+    body_fat = 64 - (20 * waist / height)
+
+    return body_fat
+
+
+def build_feature_vector(
+    gender,
+    age,
+    measurements,
+    total_height,
+    body_fat
+):
+
+    features = [
+        gender,
+        age,
+
+        measurements["shoulder_width"],
+        measurements["chest"],
+        measurements["belly"],
+        measurements["waist"],
+        measurements["hips"],
+
+        measurements["arm_length"],
+        measurements["shoulder_to_waist"],
+        measurements["waist_to_knee"],
+        measurements["leg_length"],
+
+        total_height,
+        body_fat
+    ]
+
+    return features
+
+
+================================================================================
+FILE: measurement/height_measurement.py
+================================================================================
+
+import numpy as np
+
+
+def compute_pixel_height(binary_mask):
+    """
+    Compute pixel height from segmentation mask.
+    """
+
+    rows = np.any(binary_mask, axis=1)
+    if not np.any(rows):
+        raise ValueError("No body pixels found in mask")
+
+    top = np.argmax(rows)
+    bottom = len(rows) - np.argmax(rows[::-1]) - 1
+
+    pixel_height = bottom - top
+    if pixel_height <= 0:
+        raise ValueError("Invalid pixel height computed")
+
+    return pixel_height, top, bottom
+
+
+================================================================================
+FILE: measurement/limb_measurements.py
+================================================================================
+
+import numpy as np
+
+
+def distance(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
+
+
+def compute_arm_length(pose):
+
+    left = distance(pose["left_shoulder"], pose["left_elbow"]) + \
+           distance(pose["left_elbow"], pose["left_wrist"])
+
+    right = distance(pose["right_shoulder"], pose["right_elbow"]) + \
+            distance(pose["right_elbow"], pose["right_wrist"])
+
+    return max(left, right)
+
+
+def compute_leg_length(pose):
+
+    left = distance(pose["left_hip"], pose["left_knee"]) + \
+           distance(pose["left_knee"], pose["left_ankle"])
+
+    right = distance(pose["right_hip"], pose["right_knee"]) + \
+            distance(pose["right_knee"], pose["right_ankle"])
+
+    return max(left, right)
+
+
+def compute_shoulder_to_waist(pose):
+
+    shoulder_mid = (
+        (pose["left_shoulder"][0] + pose["right_shoulder"][0]) / 2,
+        (pose["left_shoulder"][1] + pose["right_shoulder"][1]) / 2
+    )
+
+    hip_mid = (
+        (pose["left_hip"][0] + pose["right_hip"][0]) / 2,
+        (pose["left_hip"][1] + pose["right_hip"][1]) / 2
+    )
+
+    return distance(shoulder_mid, hip_mid)
+
+
+def compute_waist_to_knee(pose):
+
+    hip_mid = (
+        (pose["left_hip"][0] + pose["right_hip"][0]) / 2,
+        (pose["left_hip"][1] + pose["right_hip"][1]) / 2
+    )
+
+    knee_mid = (
+        (pose["left_knee"][0] + pose["right_knee"][0]) / 2,
+        (pose["left_knee"][1] + pose["right_knee"][1]) / 2
+    )
+
+    return distance(hip_mid, knee_mid)
+
+
+================================================================================
+FILE: measurement/torso_measurements.py
+================================================================================
+
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+
+def compute_width_profile(mask, left_shoulder_x, right_shoulder_x):
+    """
+    Compute horizontal width of the body at each row.
+    Scan only the band between the shoulders to exclude arms.
+    """
+
+    left_limit = max(int(left_shoulder_x - 40), 0)
+    right_limit = min(int(right_shoulder_x + 40), mask.shape[1])
+
+    height = mask.shape[0]
+    widths = []
+
+    for y in range(height):
+
+        row = mask[y]
+
+        region = row[left_limit:right_limit]
+
+        body_pixels = np.where(region == 1)[0]
+
+        if len(body_pixels) == 0:
+            widths.append(0)
+            continue
+
+        left = body_pixels[0]
+        right = body_pixels[-1]
+
+        widths.append(right - left)
+
+    widths = np.array(widths)
+
+    widths = gaussian_filter1d(widths, sigma=3)
+
+    return widths
+
+
+def detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y):
+
+    height = len(width_profile)
+    if height == 0:
+        raise ValueError("Invalid width profile")
+
+    torso_start = int(pose_shoulder_y)
+    torso_end = int(pose_hip_y)
+
+    # Clamp to valid array bounds.
+    torso_start = min(max(torso_start, 0), height - 1)
+    torso_end = min(max(torso_end, torso_start + 1), height)
+
+    torso = width_profile[torso_start:torso_end]
+    if torso.size == 0:
+        chest_y = waist_y = hip_y = height // 2
+        return chest_y, waist_y, hip_y
+
+    waist_index = int(np.argmin(torso))
+    waist_y = torso_start + waist_index
+
+    upper_torso = width_profile[torso_start:waist_y]
+    if upper_torso.size == 0:
+        chest_y = torso_start
+    else:
+        chest_y = torso_start + int(np.argmax(upper_torso))
+
+    lower_torso = width_profile[waist_y:torso_end]
+    if lower_torso.size == 0:
+        hip_y = waist_y
+    else:
+        hip_y = waist_y + int(np.argmax(lower_torso))
+
+    chest_y = int(min(max(chest_y, 0), height - 1))
+    waist_y = int(min(max(waist_y, 0), height - 1))
+    hip_y = int(min(max(hip_y, 0), height - 1))
+
+    return chest_y, waist_y, hip_y
+
+
+def compute_torso_widths(mask, left_shoulder_x, right_shoulder_x, pose_shoulder_y, pose_hip_y):
+
+    shoulder_width_px = max(float(right_shoulder_x - left_shoulder_x), 1.0)
+    max_torso_width = 1.4 * shoulder_width_px
+
+    width_profile = compute_width_profile(mask, left_shoulder_x, right_shoulder_x)
+
+    chest_y, waist_y, hip_y = detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y)
+
+    chest_width = min(float(width_profile[chest_y]), max_torso_width)
+    waist_width = min(float(width_profile[waist_y]), max_torso_width)
+    hip_width = min(float(width_profile[hip_y]), max_torso_width)
+
+    return {
+        "chest_width_pixels": chest_width,
+        "waist_width_pixels": waist_width,
+        "hip_width_pixels": hip_width
+    }
+
+
+================================================================================
+FILE: models/model_loader.py
+================================================================================
+
+from ultralytics import YOLO
+import joblib
+
+
+class ModelLoader:
+
+    def __init__(self):
+        self.person_model = None
+        self.pose_model = None
+        self.bodytype_model = None
+        self.label_encoder = None
+
+    def load_models(self):
+
+        if self.person_model is None:
+            print("Loading YOLO person model...")
+            self.person_model = YOLO("yolov8n.pt")
+
+        if self.pose_model is None:
+            print("Loading YOLO pose model...")
+            self.pose_model = YOLO("yolov8n-pose.pt")
+
+        if self.bodytype_model is None:
+            print("Loading body type model...")
+            self.bodytype_model = joblib.load("bodytype_model.pkl")
+
+        if self.label_encoder is None:
+            print("Loading label encoder...")
+            self.label_encoder = joblib.load("label_encoder.pkl")
+
+        return {
+            "person_model": self.person_model,
+            "pose_model": self.pose_model,
+            "bodytype_model": self.bodytype_model,
+            "label_encoder": self.label_encoder
+        }
+
+================================================================================
+FILE: pipeline/measurement_pipeline.py
+================================================================================
+
+import os
+
+import cv2
+
+from utils.image_utils import validate_dual_images
+from utils.debug_visualization import (
+	draw_bbox,
+	draw_pose,
+	draw_torso_lines,
+	overlay_mask,
+	plot_width_profile,
+	save_segmentation_with_bbox,
+	show_mask,
+)
+from measurement.depth_estimation import compute_torso_circumferences, compute_torso_depths
+from measurement.feature_scaling import (
+	build_feature_vector as build_ml_feature_vector,
+)
+from measurement.height_measurement import compute_pixel_height
+from measurement.limb_measurements import (
+	compute_arm_length,
+	compute_leg_length,
+	compute_shoulder_to_waist,
+	compute_waist_to_knee,
+	distance,
+)
+from measurement.torso_measurements import (
+	compute_torso_widths,
+	compute_width_profile,
+	detect_torso_measurements,
+)
+from vision.detection import detect_person
+from vision.pose import extract_pose_keypoints
+from vision.segmentation import HumanSegmenter
+
+
+class MeasurementPipeline:
+
+	def __init__(self, models):
+		self.person_model = models["person_model"]
+		self.pose_model = models["pose_model"]
+		self.bodytype_model = models["bodytype_model"]
+		self.label_encoder = models["label_encoder"]
+		self.segmenter = HumanSegmenter()
+
+	def _debug_visualization_enabled(self):
+		return os.getenv("BODY_DEBUG_VIS", "0") == "1"
+
+	def run(
+		self,
+		front_image,
+		side_image,
+		age,
+		gender,
+		height
+	):
+		"""
+		Main pipeline execution.
+		"""
+
+		# 1. Validate images
+		images = self.validate_images(front_image, side_image)
+
+		# 2. Detect person
+		detected = self.detect_person(images)
+
+		# 3. Segment body
+		segmented = self.segment_body(detected)
+
+		# 4. Extract pose
+		pose_data = self.extract_pose(detected)
+
+		# 5. Compute measurements (pixel space)
+		measurements_pixels = self.compute_measurements(
+			segmented,
+			pose_data,
+		)
+
+		# 6. Compute pixel height
+		pixel_height = measurements_pixels["pixel_height"]
+
+		# 7. Compute scaling factor
+		scale = height / pixel_height
+
+		# 8. Scale measurements
+		scaled_measurements = {}
+
+		for key, value in measurements_pixels.items():
+
+			if key != "pixel_height":
+				scaled_measurements[key] = float(value * scale)
+
+		# 9. Compute body fat
+		waist = scaled_measurements["waist"]
+		body_fat = float(64 - (20 * waist / height))
+
+		# 10. Build feature vector
+		features = self.build_feature_vector(
+			gender,
+			age,
+			scaled_measurements,
+			height,
+			body_fat,
+		)
+
+		# 11. Predict body type
+		prediction = self.predict_body_type(features)
+
+		return {
+			"body_type": prediction["body_type"],
+			"ayurvedic_type": prediction["ayurvedic_type"],
+			"measurements": scaled_measurements
+		}
+
+	def validate_images(self, front_image, side_image):
+		"""
+		Validate images before processing.
+		"""
+		images = validate_dual_images(front_image, side_image)
+
+		return images
+
+	def detect_person(self, images):
+		"""
+		Run YOLO person detection.
+		"""
+
+		front_result = detect_person(
+			images["front"],
+			self.person_model
+		)
+
+		side_result = detect_person(
+			images["side"],
+			self.person_model
+		)
+
+		if self._debug_visualization_enabled():
+			draw_bbox(images["front"], front_result["bbox"], filename="front_person_detection.png")
+			draw_bbox(images["side"], side_result["bbox"], filename="side_person_detection.png")
+
+		return {
+			"front_crop": front_result["crop"],
+			"side_crop": side_result["crop"],
+			"front_bbox": front_result["bbox"],
+			"side_bbox": side_result["bbox"]
+		}
+
+	def segment_body(self, images):
+		"""
+		Run segmentation model.
+		"""
+
+		front_mask = self.segmenter.segment(images["front_crop"])
+		side_mask = self.segmenter.segment(images["side_crop"])
+
+		return {
+			"front_mask": front_mask,
+			"side_mask": side_mask,
+			"front_crop": images["front_crop"],
+			"side_crop": images["side_crop"]
+		}
+
+	def extract_pose(self, images):
+		"""
+		Extract pose keypoints.
+		"""
+
+		front_pose = extract_pose_keypoints(
+			images["front_crop"],
+			self.pose_model
+		)
+
+		side_pose = extract_pose_keypoints(
+			images["side_crop"],
+			self.pose_model
+		)
+
+		return {
+			"front_pose": front_pose,
+			"side_pose": side_pose
+		}
+
+	def compute_measurements(self, segmentation_data, pose_data):
+		"""
+		Compute anthropometric measurements.
+		"""
+		front_mask = segmentation_data["front_mask"]
+		side_mask = segmentation_data["side_mask"]
+		front_crop = segmentation_data["front_crop"]
+		side_crop = segmentation_data["side_crop"]
+		front_pose = pose_data["front_pose"]
+		side_pose = pose_data["side_pose"]
+		debug_vis = self._debug_visualization_enabled()
+
+		if debug_vis:
+			show_mask(front_mask, filename="front_segmentation_mask.png")
+			show_mask(side_mask, filename="side_segmentation_mask.png")
+			overlay_mask(front_crop, front_mask, filename="front_mask_overlay.png")
+			overlay_mask(side_crop, side_mask, filename="side_mask_overlay.png")
+			save_segmentation_with_bbox(front_crop, front_mask, filename="front_segmentation_with_bbox.png")
+			save_segmentation_with_bbox(side_crop, side_mask, filename="side_segmentation_with_bbox.png")
+			draw_pose(front_crop, front_pose, filename="front_pose.png")
+			draw_pose(side_crop, side_pose, filename="side_pose.png")
+
+		pixel_height, _, _ = compute_pixel_height(front_mask)
+
+		# Extract shoulder/hip pixel coordinates from pose for anatomy-guided scanning.
+		left_shoulder_x = min(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
+		right_shoulder_x = max(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
+		pose_shoulder_y = float((front_pose["left_shoulder"][1] + front_pose["right_shoulder"][1]) / 2)
+		pose_hip_y = float((front_pose["left_hip"][1] + front_pose["right_hip"][1]) / 2)
+
+		width_profile = compute_width_profile(front_mask, left_shoulder_x, right_shoulder_x)
+		chest_y, waist_y, hip_y = detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y)
+
+		if debug_vis:
+			draw_torso_lines(front_crop, chest_y, waist_y, hip_y, filename="front_torso_rows.png")
+			plot_width_profile(width_profile, filename="front_width_profile.png")
+
+		torso_widths = compute_torso_widths(front_mask, left_shoulder_x, right_shoulder_x, pose_shoulder_y, pose_hip_y)
+		torso_depths = compute_torso_depths(side_mask, chest_y, waist_y, hip_y)
+		torso_circumferences = compute_torso_circumferences(torso_widths, torso_depths)
+
+		shoulder_width = distance(
+			front_pose["left_shoulder"],
+			front_pose["right_shoulder"],
+		)
+
+		chest = torso_circumferences["chest_pixels"]
+		if chest > 2 * shoulder_width:
+			chest = shoulder_width * 1.5
+
+		print("pixel height:", pixel_height)
+		print("chest_y waist_y hip_y:", chest_y, waist_y, hip_y)
+		print("torso_widths:", torso_widths)
+		print("torso_depths:", torso_depths)
+		print("circumferences:", torso_circumferences)
+
+		measurements_pixels = {
+			"pixel_height": float(pixel_height),
+			"shoulder_width": shoulder_width,
+			"chest": chest,
+			"waist": torso_circumferences["waist_pixels"],
+			"hips": torso_circumferences["hips_pixels"],
+			"belly": torso_circumferences["waist_pixels"] * 1.1,
+			"arm_length": compute_arm_length(front_pose),
+			"shoulder_to_waist": compute_shoulder_to_waist(front_pose),
+			"waist_to_knee": compute_waist_to_knee(front_pose),
+			"leg_length": compute_leg_length(front_pose),
+		}
+
+		return measurements_pixels
+
+	def build_feature_vector(self, gender, age, measurements, height, body_fat):
+		"""
+		Build ML feature vector.
+		"""
+		return build_ml_feature_vector(
+			gender=gender,
+			age=age,
+			measurements=measurements,
+			total_height=height,
+			body_fat=body_fat,
+		)
+
+	def map_to_ayurvedic(self, bodytype):
+		"""
+		Map Western body type to Ayurvedic type.
+		"""
+		mapping = {
+			"Ectomorph": "Vata",
+			"Mesomorph": "Pitta",
+			"Endomorph": "Kapha"
+		}
+
+		return mapping.get(bodytype, "Unknown")
+
+	def predict_body_type(self, features):
+		"""
+		Run ML model prediction.
+		"""
+		prediction = self.bodytype_model.predict([features])
+		label = self.label_encoder.inverse_transform(prediction)[0]
+
+		ayurvedic_type = self.map_to_ayurvedic(label)
+
+		return {
+			"body_type": str(label),
+			"ayurvedic_type": str(ayurvedic_type)
+		}
+
+
+================================================================================
+FILE: project_extract.py
+================================================================================
+
+#!/usr/bin/env python3
+# ============================================================================
+# PROJECT EXTRACTION UTILITY
+# ============================================================================
+# Purpose: Generate a comprehensive report of the entire Python codebase
+# Output: Single text file containing:
+#         1. Visual tree structure of project directories/files
+#         2. Complete content of all Python files
+#         3. Summary statistics
+# Usage: python Project_extract.py
+# Use Case: Code review, documentation, sharing codebase overview
+# ============================================================================
+
+"""
+Extract all Python files with their content and project structure into a single text file.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+
+def get_project_structure(root_dir, prefix="", max_depth=10, current_depth=0, ignore_dirs=None):
+    """
+    Generate a text representation of the project structure.
+    
+    Creates a tree-style visualization of directories and files.
+    Recursively traverses subdirectories while respecting depth limits.
+    
+    Args:
+        root_dir: Starting directory path
+        prefix: String prefix for tree indentation
+        max_depth: Maximum recursion depth to prevent infinite loops
+        current_depth: Current recursion level
+        ignore_dirs: Set of directory names to skip
+    
+    Returns:
+        String containing formatted directory tree
+    """
+    if ignore_dirs is None:
+        ignore_dirs = {".git", "__pycache__", ".pytest_cache", "*.egg-info", ".venv", "venv", "env", ".csv"}
+    
+    if current_depth >= max_depth:
+        return ""
+    
+    structure = ""
+    try:
+        items = sorted(os.listdir(root_dir))
+    except PermissionError:
+        return ""
+    
+    dirs = []
+    files = []
+    
+    for item in items:
+        # Skip hidden files/dirs and common ignore patterns
+        if item.startswith("."):
+            continue
+        if item in ignore_dirs or any(item.endswith(x.replace("*", "")) for x in ignore_dirs if "*" in x):
+            continue
+        
+        item_path = os.path.join(root_dir, item)
+        if os.path.isdir(item_path):
+            dirs.append(item)
+        else:
+            files.append(item)
+    
+    # Add files first
+    for i, file in enumerate(files):
+        is_last_file = (i == len(files) - 1) and len(dirs) == 0
+        structure += f"{prefix}{'└── ' if is_last_file else '├── '}{file}\n"
+    
+    # Add directories
+    for i, dir_name in enumerate(dirs):
+        is_last = i == len(dirs) - 1
+        structure += f"{prefix}{'└── ' if is_last else '├── '}{dir_name}/\n"
+        
+        dir_path = os.path.join(root_dir, dir_name)
+        extension = "    " if is_last else "│   "
+        structure += get_project_structure(dir_path, prefix + extension, max_depth, current_depth + 1, ignore_dirs)
+    
+    return structure
+
+
+def extract_python_files(root_dir, output_file):
+    """
+    Extract all Python files and their content.
+    
+    Main extraction function that:
+    1. Walks through directory tree to find all .py files
+    2. Generates project structure visualization
+    3. Writes formatted output with all file contents
+    4. Provides summary statistics
+    
+    Args:
+        root_dir: Root directory to scan
+        output_file: Path to output text file
+    """
+    py_files = []
+    
+    # Collect all Python files
+    for root, dirs, files in os.walk(root_dir):
+        # Skip certain directories
+        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "env", ".csv"}]
+        
+        for file in files:
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+                py_files.append(file_path)
+    
+    # Sort files for consistent output
+    py_files.sort()
+    
+    # Write to output file
+    with open(output_file, "w", encoding="utf-8") as out:
+        # Header
+        out.write("=" * 80 + "\n")
+        out.write("PROJECT EXTRACTION REPORT\n")
+        out.write("=" * 80 + "\n\n")
+        
+        # Project Structure
+        out.write("PROJECT STRUCTURE:\n")
+        out.write("-" * 80 + "\n\n")
+        out.write(f"{os.path.basename(root_dir)}/\n")
+        out.write(get_project_structure(root_dir))
+        out.write("\n\n")
+        
+        # File Contents
+        out.write("=" * 80 + "\n")
+        out.write("FILE CONTENTS\n")
+        out.write("=" * 80 + "\n\n")
+        
+        for file_path in py_files:
+            # Calculate relative path
+            rel_path = os.path.relpath(file_path, root_dir)
+            
+            # Write file header
+            out.write(f"\n{'=' * 80}\n")
+            out.write(f"FILE: {rel_path}\n")
+            out.write(f"{'=' * 80}\n\n")
+            
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    out.write(content)
+            except Exception as e:
+                out.write(f"[ERROR] Could not read file: {str(e)}\n")
+            
+            out.write("\n")
+        
+        # Summary
+        out.write("\n" + "=" * 80 + "\n")
+        out.write(f"SUMMARY: {len(py_files)} Python files extracted\n")
+        out.write("=" * 80 + "\n")
+    
+    print(f"✓ Extraction complete!")
+    print(f"✓ Total Python files: {len(py_files)}")
+    print(f"✓ Output saved to: {output_file}")
+    print(f"✓ File size: {os.path.getsize(output_file) / 1024:.2f} KB")
+
+
+if __name__ == "__main__":
+    # Get project root (current directory)
+    project_root = os.getcwd()
+    
+    # Output file
+    output_filename = "project_extraction.txt"
+    output_path = os.path.join(project_root, output_filename)
+    
+    print(f"Extracting Python files from: {project_root}")
+    print(f"Output file: {output_path}\n")
+    
+    extract_python_files(project_root, output_path)
+
+
+================================================================================
+FILE: test.py
+================================================================================
+
+from ultralytics import YOLO
+import cv2
+from vision.detection import detect_person
+
+model = YOLO("yolov8n.pt")
+
+img = cv2.imread("image.jpg")
+
+result = detect_person(img, model)
+
+print(result["bbox"])
+
+================================================================================
+FILE: tmp_smoke_test.py
+================================================================================
+
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+with open("test/front1.jpeg", "rb") as front_file, open("test/side1.jpeg", "rb") as side_file:
+    response = client.post(
+        "/detect/",
+        files={
+            "front_image": ("front1.jpeg", front_file, "image/jpeg"),
+            "side_image": ("side1.jpeg", side_file, "image/jpeg"),
+        },
+        data={
+            "age": "27",
+            "gender": "1",
+            "height": "175",
+        },
+    )
+
+print("status:", response.status_code)
+print("body:", response.text)
+
+
+================================================================================
+FILE: utils/debug_visualization.py
+================================================================================
+
+import os
+
+import cv2
+import matplotlib.pyplot as plt
+
+DEBUG_DIR = "/home/vedant/body-measurement-api/debug"
+
+
+def clear_debug_folder():
+    """Remove prior debug outputs so each run writes a clean, replaced set."""
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    for name in os.listdir(DEBUG_DIR):
+        path = os.path.join(DEBUG_DIR, name)
+        if os.path.isfile(path):
+            os.remove(path)
+
+
+def _save(filename, img):
+    """Save an OpenCV image to the debug folder, overwriting any previous file."""
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    path = os.path.join(DEBUG_DIR, filename)
+    cv2.imwrite(path, img)
+
+
+def _show(window_name, img):
+    """Attempt an on-screen display; silently skip in headless environments."""
+    try:
+        cv2.imshow(window_name, img)
+        cv2.waitKey(1)
+        cv2.destroyWindow(window_name)
+    except cv2.error:
+        pass
+
+
+def draw_bbox(image, bbox, filename="person_detection.png"):
+    """Draw person detection bounding box."""
+    x1, y1, x2, y2 = bbox
+
+    img = image.copy()
+    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    _save(filename, img)
+    _show("Person Detection", img)
+
+
+def show_mask(mask, filename="segmentation_mask.png"):
+    """Visualize binary segmentation mask."""
+    vis = (mask * 255).astype("uint8")
+
+    _save(filename, vis)
+    _show("Segmentation Mask", vis)
+
+
+def overlay_mask(image, mask, filename="mask_overlay.png"):
+    """Overlay binary mask on image."""
+    colored = image.copy()
+    colored[mask == 1] = [0, 255, 0]
+    blended = cv2.addWeighted(image, 0.7, colored, 0.3, 0)
+
+    _save(filename, blended)
+    _show("Mask Overlay", blended)
+
+
+def save_segmentation_with_bbox(image, mask, filename="segmentation_with_bbox.png"):
+    """Save segmentation overlay with a tight mask bounding box and labels."""
+    colored = image.copy()
+    colored[mask == 1] = [0, 255, 0]
+    blended = cv2.addWeighted(image, 0.7, colored, 0.3, 0)
+
+    mask_u8 = (mask.astype("uint8") * 255)
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+        cv2.rectangle(blended, (x, y), (x + w, y + h), (0, 255, 255), 2)
+        cv2.putText(blended, "Segmentation BBox", (x, max(y - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+    cv2.putText(blended, "Green: Segmentation", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    _save(filename, blended)
+    _show("Segmentation With BBox", blended)
+
+
+def draw_pose(image, pose, filename="pose.png"):
+    """Draw pose keypoints with labels."""
+    img = image.copy()
+
+    for name, point in pose.items():
+        x, y = int(point[0]), int(point[1])
+        cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
+        cv2.putText(img, name, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+
+    _save(filename, img)
+    _show("Pose", img)
+
+
+def draw_torso_lines(image, chest_y, waist_y, hip_y, filename="torso_rows.png"):
+    """Draw horizontal torso measurement rows."""
+    img = image.copy()
+
+    h, w, _ = img.shape
+    _ = h
+
+    cv2.line(img, (0, int(chest_y)), (w, int(chest_y)), (255, 0, 0), 2)
+    cv2.line(img, (0, int(waist_y)), (w, int(waist_y)), (0, 255, 0), 2)
+    cv2.line(img, (0, int(hip_y)),   (w, int(hip_y)),   (0, 0, 255), 2)
+
+    cv2.putText(img, "Chest (Blue)", (8, max(int(chest_y) - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
+    cv2.putText(img, "Waist (Green)", (8, max(int(waist_y) - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    cv2.putText(img, "Hips (Red)", (8, max(int(hip_y) - 6, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+    _save(filename, img)
+    _show("Torso Rows", img)
+
+
+def plot_width_profile(width_profile, filename="width_profile.png"):
+    """Plot torso width profile curve."""
+    fig, ax = plt.subplots()
+    ax.plot(width_profile)
+    ax.set_title("Torso Width Profile")
+    ax.set_xlabel("Body Height")
+    ax.set_ylabel("Width")
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    path = os.path.join(DEBUG_DIR, filename)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+================================================================================
+FILE: utils/image_utils.py
+================================================================================
+
+import cv2
+import numpy as np
+
+
+def validate_image(image):
+    """
+    Validate decoded image.
+    """
+
+    if image is None:
+        raise ValueError("Image decoding failed")
+
+    if not isinstance(image, np.ndarray):
+        raise ValueError("Invalid image format")
+
+    if image.size == 0:
+        raise ValueError("Empty image data")
+
+    height, width = image.shape[:2]
+
+    if height == 0 or width == 0:
+        raise ValueError("Image has invalid dimensions")
+
+    if height < 200 or width < 200:
+        raise ValueError("Image resolution too small")
+
+    return True
+
+
+def validate_dual_images(front_image, side_image):
+    """
+    Validate both front and side images.
+    """
+
+    validate_image(front_image)
+    validate_image(side_image)
+
+    return {
+        "front": front_image,
+        "side": side_image
+    }
+
+
+================================================================================
+FILE: utils/stabilization.py
+================================================================================
+
+import numpy as np
+
+
+def median_filter_measurements(measurement_list):
+    """
+    Compute median values across multiple measurement frames.
+    """
+
+    keys = measurement_list[0].keys()
+
+    stabilized = {}
+
+    for key in keys:
+
+        values = [m[key] for m in measurement_list]
+
+        stabilized[key] = float(np.median(values))
+
+    return stabilized
+
+
+================================================================================
+FILE: vision/detection.py
+================================================================================
+
+import cv2
+
+
+def detect_person(image, model):
+    """
+    Detect person using YOLOv8 and return bounding box and cropped image.
+    """
+
+    results = model(image)
+
+    person_bbox = None
+
+    for r in results:
+        boxes = r.boxes.xyxy
+
+        if boxes is None or len(boxes) == 0:
+            raise ValueError("No person detected")
+
+        # Take first detected person
+        x1, y1, x2, y2 = map(int, boxes[0][:4])
+
+        person_bbox = (x1, y1, x2, y2)
+
+        break
+
+    if person_bbox is None:
+        raise ValueError("Person detection failed")
+
+    x1, y1, x2, y2 = person_bbox
+
+    person_crop = image[y1:y2, x1:x2]
+
+    return {
+        "bbox": person_bbox,
+        "crop": person_crop
+    }
+
+
+================================================================================
+FILE: vision/pose.py
+================================================================================
+
+import numpy as np
+
+
+def extract_pose_keypoints(image, pose_model):
+    """
+    Run YOLOv8 pose estimation and extract keypoints required
+    for limb measurements.
+    """
+
+    results = pose_model(image)
+
+    for r in results:
+
+        keypoints = r.keypoints.xy.cpu().numpy()
+
+        if keypoints is None or len(keypoints) == 0:
+            raise ValueError("No pose detected")
+
+        k = keypoints[0]
+
+        pose_data = {
+            "left_shoulder": k[5],
+            "right_shoulder": k[6],
+
+            "left_elbow": k[7],
+            "right_elbow": k[8],
+
+            "left_wrist": k[9],
+            "right_wrist": k[10],
+
+            "left_hip": k[11],
+            "right_hip": k[12],
+
+            "left_knee": k[13],
+            "right_knee": k[14],
+
+            "left_ankle": k[15],
+            "right_ankle": k[16],
+        }
+
+        return pose_data
+
+    raise ValueError("Pose extraction failed")
+
+
+================================================================================
+FILE: vision/segmentation.py
+================================================================================
+
+import cv2
+import numpy as np
+import mediapipe as mp
+
+
+class HumanSegmenter:
+
+    def __init__(self):
+        self.segmenter = None
+
+        # Support both legacy and alternate mediapipe module layouts.
+        if hasattr(mp, "solutions") and hasattr(mp.solutions, "selfie_segmentation"):
+            self.segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+            return
+
+        try:
+            from mediapipe.python.solutions import selfie_segmentation
+
+            self.segmenter = selfie_segmentation.SelfieSegmentation(model_selection=1)
+        except Exception:
+            self.segmenter = None
+
+    def segment(self, image):
+        """
+        Generate binary silhouette mask from input image.
+        """
+
+        if self.segmenter is None:
+            return self._fallback_segment(image)
+
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        results = self.segmenter.process(image_rgb)
+
+        mask = results.segmentation_mask
+
+        if mask is None:
+            raise ValueError("Segmentation failed")
+
+        # Convert to binary mask
+        binary_mask = (mask > 0.5).astype(np.uint8)
+
+        # Morphological smoothing to remove noise
+        kernel = np.ones((5, 5), np.uint8)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+
+        return binary_mask
+
+    def _fallback_segment(self, image):
+        """
+        Fallback silhouette extraction when mediapipe selfie segmentation is unavailable.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask = cv2.threshold(blurred, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Keep the largest foreground component to approximate the human silhouette.
+        contours, _ = cv2.findContours((mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            raise ValueError("Segmentation failed")
+
+        largest = max(contours, key=cv2.contourArea)
+        binary_mask = np.zeros_like(mask, dtype=np.uint8)
+        cv2.drawContours(binary_mask, [largest], -1, color=1, thickness=cv2.FILLED)
+
+        kernel = np.ones((5, 5), np.uint8)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+        return binary_mask
+
+
+================================================================================
+SUMMARY: 17 Python files extracted
+================================================================================

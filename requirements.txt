@@ -1,11 +1,8 @@
-fastapi
-uvicorn
 ultralytics
 opencv-python-headless
 numpy
-python-multipart
 joblib
 scikit-learn
-pydantic
 torch
 torchvision
+matplotlib
