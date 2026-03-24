@@ -27,6 +27,18 @@ def validate_image(image):
     return True
 
 
+def validate_single_image(image):
+    """
+    Validate and return a single image payload.
+    """
+
+    validate_image(image)
+
+    return {
+        "image": image
+    }
+
+
 def validate_dual_images(front_image, side_image):
     """
     Validate both front and side images.

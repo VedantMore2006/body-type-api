@@ -1,22 +1,14 @@
 import os
+import math
 
-import cv2
-
-from utils.image_utils import validate_dual_images
+from utils.image_utils import validate_single_image
 from utils.debug_visualization import (
 	draw_bbox,
 	draw_pose,
-	draw_torso_lines,
-	overlay_mask,
-	plot_width_profile,
-	save_segmentation_with_bbox,
-	show_mask,
 )
-from measurement.depth_estimation import compute_torso_circumferences, compute_torso_depths
 from measurement.feature_scaling import (
 	build_feature_vector as build_ml_feature_vector,
 )
-from measurement.height_measurement import compute_pixel_height
 from measurement.limb_measurements import (
 	compute_arm_length,
 	compute_leg_length,
@@ -24,14 +16,15 @@ from measurement.limb_measurements import (
 	compute_waist_to_knee,
 	distance,
 )
-from measurement.torso_measurements import (
-	compute_torso_widths,
-	compute_width_profile,
-	detect_torso_measurements,
+from vision.detection import (
+	bbox_center_x,
+	bbox_height,
+	bbox_width,
+	detect_door_heuristic,
+	detect_person,
+	is_bbox_fully_visible,
 )
-from vision.detection import detect_person
 from vision.pose import extract_pose_keypoints
-from vision.segmentation import HumanSegmenter
 
 
 class MeasurementPipeline:
@@ -41,209 +34,219 @@ class MeasurementPipeline:
 		self.pose_model = models["pose_model"]
 		self.bodytype_model = models["bodytype_model"]
 		self.label_encoder = models["label_encoder"]
-		self.segmenter = HumanSegmenter()
 
 	def _debug_visualization_enabled(self):
 		return os.getenv("BODY_DEBUG_VIS", "0") == "1"
 
 	def run(
 		self,
-		front_image,
-		side_image,
+		image,
 		age,
 		gender,
-		height
+		door_real_height_cm=200.0,
+		door_bbox_override=None,
 	):
 		"""
-		Main pipeline execution.
+		Main pipeline execution for door-reference scaling.
 		"""
 
-		# 1. Validate images
-		images = self.validate_images(front_image, side_image)
+		# 1. Validate input image
+		payload = self.validate_image(image)
+		frame = payload["image"]
 
-		# 2. Detect person
-		detected = self.detect_person(images)
+		# 2. Detect person and door in the same frame
+		detection = self.detect_entities(frame, door_bbox_override=door_bbox_override)
+		person_bbox = detection["person_bbox"]
+		door_bbox = detection["door_bbox"]
 
-		# 3. Segment body
-		segmented = self.segment_body(detected)
+		# 3. Guardrails for common geometric failures
+		self.validate_reference_geometry(frame, person_bbox, door_bbox)
 
-		# 4. Extract pose
-		pose_data = self.extract_pose(detected)
+		# 4. Extract pose from person crop
+		pose_data = self.extract_pose(detection["person_crop"])
+		front_pose = pose_data["front_pose"]
 
-		# 5. Compute measurements (pixel space)
+		# 5. Compute scale from known door height
+		door_height_px = float(bbox_height(door_bbox))
+		if door_height_px <= 0:
+			raise ValueError("Invalid door height in pixels")
+
+		scale_cm_per_px = float(door_real_height_cm / door_height_px)
+
+		# 6. Compute measurements in pixel space
 		measurements_pixels = self.compute_measurements(
-			segmented,
-			pose_data,
+			front_pose=front_pose,
+			person_bbox=person_bbox,
 		)
 
-		# 6. Compute pixel height
-		pixel_height = measurements_pixels["pixel_height"]
-
-		# 7. Compute scaling factor
-		scale = height / pixel_height
-
-		# 8. Scale measurements
+		# 7. Scale measurements into centimeters
 		scaled_measurements = {}
-
 		for key, value in measurements_pixels.items():
-
 			if key != "pixel_height":
-				scaled_measurements[key] = float(value * scale)
+				scaled_measurements[key] = float(value * scale_cm_per_px)
 
-		# 9. Compute body fat
+		person_height_cm = float(measurements_pixels["pixel_height"] * scale_cm_per_px)
+		scaled_measurements["height"] = person_height_cm
+
+		# 8. Compute body fat from scaled waist and estimated height
 		waist = scaled_measurements["waist"]
-		body_fat = float(64 - (20 * waist / height))
+		body_fat = float(64 - (20 * waist / person_height_cm))
 
-		# 10. Build feature vector
+		# 9. Build feature vector
 		features = self.build_feature_vector(
 			gender,
 			age,
 			scaled_measurements,
-			height,
+			person_height_cm,
 			body_fat,
 		)
 
-		# 11. Predict body type
+		# 10. Predict body type
 		prediction = self.predict_body_type(features)
 
 		return {
 			"body_type": prediction["body_type"],
 			"ayurvedic_type": prediction["ayurvedic_type"],
-			"measurements": scaled_measurements
+			"measurements": scaled_measurements,
+			"meta": {
+				"method": "door_reference",
+				"scale_cm_per_px": scale_cm_per_px,
+				"door_height_px": door_height_px,
+				"person_height_px": float(measurements_pixels["pixel_height"]),
+				"detection_confidence": {
+					"person": float(detection["person_confidence"]),
+					"door": float(detection["door_confidence"]),
+				},
+			},
 		}
 
-	def validate_images(self, front_image, side_image):
+	def validate_image(self, image):
 		"""
-		Validate images before processing.
+		Validate image before processing.
 		"""
-		images = validate_dual_images(front_image, side_image)
+		payload = validate_single_image(image)
 
-		return images
+		return payload
 
-	def detect_person(self, images):
+	def detect_entities(self, image, door_bbox_override=None):
 		"""
-		Run YOLO person detection.
+		Run person and door detection on same frame.
 		"""
 
-		front_result = detect_person(
-			images["front"],
+		person_result = detect_person(
+			image,
 			self.person_model
 		)
 
-		side_result = detect_person(
-			images["side"],
-			self.person_model
-		)
+		if door_bbox_override is not None:
+			door_result = {
+				"bbox": tuple(door_bbox_override),
+				"crop": image[door_bbox_override[1]:door_bbox_override[3], door_bbox_override[0]:door_bbox_override[2]],
+				"confidence": 1.0,
+			}
+		else:
+			try:
+				door_result = detect_door_heuristic(
+					image
+				)
+			except ValueError as exc:
+				raise ValueError(
+					"Door detection failed. Provide --door-bbox x1,y1,x2,y2 or use an image with a clear full door"
+				) from exc
 
 		if self._debug_visualization_enabled():
-			draw_bbox(images["front"], front_result["bbox"], filename="front_person_detection.png")
-			draw_bbox(images["side"], side_result["bbox"], filename="side_person_detection.png")
+			draw_bbox(image, person_result["bbox"], filename="person_detection.png")
+			draw_bbox(image, door_result["bbox"], filename="door_detection.png")
 
 		return {
-			"front_crop": front_result["crop"],
-			"side_crop": side_result["crop"],
-			"front_bbox": front_result["bbox"],
-			"side_bbox": side_result["bbox"]
+			"person_crop": person_result["crop"],
+			"person_bbox": person_result["bbox"],
+			"person_confidence": person_result["confidence"],
+			"door_bbox": door_result["bbox"],
+			"door_confidence": door_result["confidence"],
 		}
 
-	def segment_body(self, images):
+	def validate_reference_geometry(self, image, person_bbox, door_bbox):
 		"""
-		Run segmentation model.
+		Reject frames that are likely to produce unstable scaling.
 		"""
 
-		front_mask = self.segmenter.segment(images["front_crop"])
-		side_mask = self.segmenter.segment(images["side_crop"])
+		if not is_bbox_fully_visible(door_bbox, image.shape):
+			raise ValueError("Door is not fully visible. Please capture full door in frame")
 
-		return {
-			"front_mask": front_mask,
-			"side_mask": side_mask,
-			"front_crop": images["front_crop"],
-			"side_crop": images["side_crop"]
-		}
+		if not is_bbox_fully_visible(person_bbox, image.shape):
+			raise ValueError("Person is not fully visible. Please capture full body in frame")
 
-	def extract_pose(self, images):
+		frame_width = float(image.shape[1])
+		person_center_x = bbox_center_x(person_bbox)
+		door_center_x = bbox_center_x(door_bbox)
+
+		if abs(person_center_x - door_center_x) > (0.35 * frame_width):
+			raise ValueError("Person appears too far from door. Keep person and door on same plane")
+
+		if bbox_height(door_bbox) <= bbox_height(person_bbox) * 0.5:
+			raise ValueError("Detected door looks too small. Move camera or frame the full door")
+
+	def extract_pose(self, person_crop):
 		"""
-		Extract pose keypoints.
+		Extract pose keypoints from person crop.
 		"""
 
 		front_pose = extract_pose_keypoints(
-			images["front_crop"],
-			self.pose_model
+			person_crop,
+			self.pose_model,
 		)
 
-		side_pose = extract_pose_keypoints(
-			images["side_crop"],
-			self.pose_model
-		)
+		if self._debug_visualization_enabled():
+			draw_pose(person_crop, front_pose, filename="person_pose.png")
 
 		return {
 			"front_pose": front_pose,
-			"side_pose": side_pose
 		}
 
-	def compute_measurements(self, segmentation_data, pose_data):
+	def _ellipse_circumference(self, width, depth):
 		"""
-		Compute anthropometric measurements.
+		Approximate torso circumference from width/depth ellipse.
 		"""
-		front_mask = segmentation_data["front_mask"]
-		side_mask = segmentation_data["side_mask"]
-		front_crop = segmentation_data["front_crop"]
-		side_crop = segmentation_data["side_crop"]
-		front_pose = pose_data["front_pose"]
-		side_pose = pose_data["side_pose"]
-		debug_vis = self._debug_visualization_enabled()
 
-		if debug_vis:
-			show_mask(front_mask, filename="front_segmentation_mask.png")
-			show_mask(side_mask, filename="side_segmentation_mask.png")
-			overlay_mask(front_crop, front_mask, filename="front_mask_overlay.png")
-			overlay_mask(side_crop, side_mask, filename="side_mask_overlay.png")
-			save_segmentation_with_bbox(front_crop, front_mask, filename="front_segmentation_with_bbox.png")
-			save_segmentation_with_bbox(side_crop, side_mask, filename="side_segmentation_with_bbox.png")
-			draw_pose(front_crop, front_pose, filename="front_pose.png")
-			draw_pose(side_crop, side_pose, filename="side_pose.png")
+		a = max(float(width), 1.0) / 2.0
+		b = max(float(depth), 1.0) / 2.0
 
-		pixel_height, _, _ = compute_pixel_height(front_mask)
+		return math.pi * (3.0 * (a + b) - math.sqrt((3.0 * a + b) * (a + 3.0 * b)))
 
-		# Extract shoulder/hip pixel coordinates from pose for anatomy-guided scanning.
-		left_shoulder_x = min(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
-		right_shoulder_x = max(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
-		pose_shoulder_y = float((front_pose["left_shoulder"][1] + front_pose["right_shoulder"][1]) / 2)
-		pose_hip_y = float((front_pose["left_hip"][1] + front_pose["right_hip"][1]) / 2)
-
-		width_profile = compute_width_profile(front_mask, left_shoulder_x, right_shoulder_x)
-		chest_y, waist_y, hip_y = detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y)
-
-		if debug_vis:
-			draw_torso_lines(front_crop, chest_y, waist_y, hip_y, filename="front_torso_rows.png")
-			plot_width_profile(width_profile, filename="front_width_profile.png")
-
-		torso_widths = compute_torso_widths(front_mask, left_shoulder_x, right_shoulder_x, pose_shoulder_y, pose_hip_y)
-		torso_depths = compute_torso_depths(side_mask, chest_y, waist_y, hip_y)
-		torso_circumferences = compute_torso_circumferences(torso_widths, torso_depths)
+	def compute_measurements(self, front_pose, person_bbox):
+		"""
+		Compute measurements in pixel space from pose and person bbox.
+		"""
+		pixel_height = float(bbox_height(person_bbox))
+		if pixel_height <= 0:
+			raise ValueError("Invalid person height in pixels")
 
 		shoulder_width = distance(
 			front_pose["left_shoulder"],
 			front_pose["right_shoulder"],
 		)
 
-		chest = torso_circumferences["chest_pixels"]
+		person_width = float(bbox_width(person_bbox))
+
+		chest_width = max(shoulder_width * 1.18, person_width * 0.42)
+		waist_width = max(chest_width * 0.88, person_width * 0.36)
+		hip_width = max(waist_width * 1.06, person_width * 0.40)
+
+		chest = self._ellipse_circumference(chest_width, chest_width * 0.68)
+		waist = self._ellipse_circumference(waist_width, waist_width * 0.72)
+		hips = self._ellipse_circumference(hip_width, hip_width * 0.74)
+
 		if chest > 2 * shoulder_width:
 			chest = shoulder_width * 1.5
-
-		print("pixel height:", pixel_height)
-		print("chest_y waist_y hip_y:", chest_y, waist_y, hip_y)
-		print("torso_widths:", torso_widths)
-		print("torso_depths:", torso_depths)
-		print("circumferences:", torso_circumferences)
 
 		measurements_pixels = {
 			"pixel_height": float(pixel_height),
 			"shoulder_width": shoulder_width,
 			"chest": chest,
-			"waist": torso_circumferences["waist_pixels"],
-			"hips": torso_circumferences["hips_pixels"],
-			"belly": torso_circumferences["waist_pixels"] * 1.1,
+			"waist": waist,
+			"hips": hips,
+			"belly": waist * 1.1,
 			"arm_length": compute_arm_length(front_pose),
 			"shoulder_to_waist": compute_shoulder_to_waist(front_pose),
 			"waist_to_knee": compute_waist_to_knee(front_pose),

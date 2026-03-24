@@ -1,29 +1,72 @@
-# Object Dimension Measurement API
+# Body Measurement Pipeline (Door Reference Baseline)
 
-Yo, fam! This repo is your go-to for a dope FastAPI app that measures human dimensions (height, shoulder width, etc.) using YOLOv8 models. Built for Android integration—let’s get it poppin’! 🚀
+This project estimates body measurements from a single image using a known-height door as the reference object.
 
-## What’s Inside?
-- `api.py`: The main FastAPI app with YOLO-based detection and pose estimation.
-- `yolov8n.pt` & `yolov8n-pose.pt`: Pre-trained models for person and pose detection.
-- `Dockerfile`: Container setup to run the app anywhere.
-- Test images (`s1.jpg`, `s2.jpg`, etc.): Sample data to vibe with.
+## Current Baseline
 
-## How It Works
-1. Upload an image with an A4 sheet for scale.
-2. API detects the person, estimates pose, and returns measurements (cm) like:
-   - Total Height
-   - Shoulder Width
-   - Arm Length
-   - And more!
-3. Secured with an API key (`x-api-key` header).
+- Input: one image containing both person and door.
+- Person detection: YOLOv8 (`yolov8n.pt`).
+- Door detection: OpenCV contour-based vertical rectangle heuristic.
+- Scale: `cm_per_pixel = door_real_height_cm / door_height_px`.
+- Height estimate: `person_height_cm = person_height_px * cm_per_pixel`.
+- Additional measurements: pose-based limb distances and heuristic torso circumferences, all scaled by the same factor.
 
-## Setup & Run Locally
+## Why This Baseline
+
+The goal is to ship a simple and fast reference-object approach first, then iterate on robustness.
+
+## Limitations
+
+- Door detector is heuristic and may fail in cluttered scenes.
+- Perspective and depth mismatch can distort scale.
+- Camera tilt can bias vertical pixel measurements.
+- Torso circumferences are approximations in this phase.
+
+## Run Locally
+
 ### Prerequisites
-- Docker installed (`sudo pacman -S docker` on Arch).
-- Python 3.13 env (e.g., `yolox_env`).
 
-### Steps
-1. Clone this repo:
-   ```bash
-   git clone <your-repo-url>
-   cd all_parameters
+- Python environment with dependencies from `requirements.txt`
+- Model files:
+   - `yolov8n.pt`
+   - `yolov8n-pose.pt`
+   - `bodytype_model.pkl`
+   - `label_encoder.pkl`
+
+### Command
+
+```bash
+python main.py \
+   --image test/front1.jpg \
+   --door-height-cm 200 \
+   --age 24 \
+   --gender 1 \
+   --debug-vis 0
+```
+
+If automatic door detection fails, provide the door region manually:
+
+```bash
+python main.py \
+   --image test/front1.jpg \
+   --door-height-cm 200 \
+   --door-bbox 120,40,310,980 \
+   --age 24 \
+   --gender 1 \
+   --debug-vis 0
+```
+
+## Output
+
+The pipeline returns:
+
+- `body_type`
+- `ayurvedic_type`
+- `measurements` (including estimated `height` in cm)
+- `meta` (method, scale, pixel heights, detection confidences)
+
+## Next Up
+
+- Add a trained door detector as a fallback/upgrade path.
+- Add frame quality confidence and stricter rejection rules.
+- Add multi-frame smoothing for stability.
