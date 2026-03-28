@@ -43,6 +43,53 @@ def draw_bbox(image, bbox, filename="person_detection.png"):
     _show("Person Detection", img)
 
 
+def draw_reference_overlay(
+    image,
+    person_bbox,
+    door_bbox,
+    scale_cm_per_px,
+    estimated_height_cm,
+    filename="reference_overlay.png",
+):
+    """Draw person + door boxes and reference scaling summary on one frame."""
+    img = image.copy()
+
+    px1, py1, px2, py2 = person_bbox
+    dx1, dy1, dx2, dy2 = door_bbox
+
+    cv2.rectangle(img, (px1, py1), (px2, py2), (60, 220, 60), 3)
+    cv2.rectangle(img, (dx1, dy1), (dx2, dy2), (60, 160, 255), 3)
+
+    cv2.putText(img, "Person", (px1, max(py1 - 10, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 220, 60), 2)
+    cv2.putText(img, "Door", (dx1, max(dy1 - 10, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 160, 255), 2)
+
+    door_height_px = max(dy2 - dy1, 1)
+    person_height_px = max(py2 - py1, 1)
+
+    summary_lines = [
+        f"scale: {scale_cm_per_px:.4f} cm/px",
+        f"door height: {door_height_px} px",
+        f"person height: {person_height_px} px",
+        f"estimated height: {estimated_height_cm:.1f} cm",
+    ]
+
+    x0 = 14
+    y0 = 28
+    line_h = 24
+
+    panel_w = 430
+    panel_h = 18 + line_h * len(summary_lines)
+    cv2.rectangle(img, (x0 - 8, y0 - 18), (x0 - 8 + panel_w, y0 - 18 + panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (x0 - 8, y0 - 18), (x0 - 8 + panel_w, y0 - 18 + panel_h), (230, 230, 230), 1)
+
+    for idx, line in enumerate(summary_lines):
+        y = y0 + (idx * line_h)
+        cv2.putText(img, line, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+
+    _save(filename, img)
+    _show("Reference Overlay", img)
+
+
 def show_mask(mask, filename="segmentation_mask.png"):
     """Visualize binary segmentation mask."""
     vis = (mask * 255).astype("uint8")

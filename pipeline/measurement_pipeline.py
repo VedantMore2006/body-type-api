@@ -5,6 +5,7 @@ from utils.image_utils import validate_single_image
 from utils.debug_visualization import (
 	draw_bbox,
 	draw_pose,
+	draw_reference_overlay,
 )
 from measurement.feature_scaling import (
 	build_feature_vector as build_ml_feature_vector,
@@ -87,6 +88,16 @@ class MeasurementPipeline:
 
 		person_height_cm = float(measurements_pixels["pixel_height"] * scale_cm_per_px)
 		scaled_measurements["height"] = person_height_cm
+
+		if self._debug_visualization_enabled():
+			draw_reference_overlay(
+				frame,
+				person_bbox=person_bbox,
+				door_bbox=door_bbox,
+				scale_cm_per_px=scale_cm_per_px,
+				estimated_height_cm=person_height_cm,
+				filename="reference_overlay.png",
+			)
 
 		# 8. Compute body fat from scaled waist and estimated height
 		waist = scaled_measurements["waist"]

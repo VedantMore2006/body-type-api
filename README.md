@@ -65,6 +65,13 @@ The pipeline returns:
 - `measurements` (including estimated `height` in cm)
 - `meta` (method, scale, pixel heights, detection confidences)
 
+When `--debug-vis 1` is enabled, debug images are saved in `debug/`, including:
+
+- `person_detection.png`
+- `door_detection.png`
+- `person_pose.png`
+- `reference_overlay.png` (person + door boxes with scale and estimated height)
+
 ## Next Up
 
 - Add a trained door detector as a fallback/upgrade path.
