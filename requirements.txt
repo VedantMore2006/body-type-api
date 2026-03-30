@@ -6,3 +6,5 @@ scikit-learn
 torch
 torchvision
 matplotlib
+mediapipe
+scipy

@@ -39,22 +39,10 @@ def _load_image(path: Path):
     return image
 
 
-def _parse_bbox_arg(bbox_text: str | None):
-    if not bbox_text:
-        return None
-
-    values = [item.strip() for item in bbox_text.split(",")]
-    if len(values) != 4:
-        raise ValueError("--door-bbox must be in format x1,y1,x2,y2")
-
-    x1, y1, x2, y2 = map(int, values)
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError("--door-bbox coordinates are invalid")
-
-    return (x1, y1, x2, y2)
 
 
-def run_pipeline(image_path: str, age: float, gender: float, door_height_cm: float, door_bbox=None):
+
+def run_pipeline(image_path: str, age: float, gender: float, person_height_cm: float, person_weight_kg: float):
     """Run the body measurement pipeline and return API-compatible output."""
     from models.model_loader import ModelLoader
     from pipeline.measurement_pipeline import MeasurementPipeline
@@ -70,8 +58,8 @@ def run_pipeline(image_path: str, age: float, gender: float, door_height_cm: flo
         image=image,
         age=age,
         gender=gender,
-        door_real_height_cm=door_height_cm,
-        door_bbox_override=door_bbox,
+        person_height_cm=person_height_cm,
+        person_weight_kg=person_weight_kg,
     )
 
 
@@ -80,8 +68,8 @@ def parse_args():
     parser.add_argument("--image", default="test/front1.jpg", help="Image path containing person and door")
     parser.add_argument("--gender", type=float, default=1, help="Gender (0 or 1)")
     parser.add_argument("--age", type=float, default=20, help="Age in years")
-    parser.add_argument("--door-height-cm", type=float, default=200.0, help="Known real-world door height in centimeters")
-    parser.add_argument("--door-bbox", default=None, help="Optional manual door bbox as x1,y1,x2,y2")
+    parser.add_argument("--person-height-cm", type=float, default=170.0, help="User's true height in centimeters")
+    parser.add_argument("--person-weight-kg", type=float, default=65.0, help="User's true weight in kilograms")
     parser.add_argument("--debug-vis", type=int, choices=[0, 1], default=1, help="Save debug visualizations (1=on, 0=off)")
     return parser.parse_args()
 
@@ -90,15 +78,14 @@ def main():
     from utils.debug_visualization import clear_debug_folder
 
     args = parse_args()
-    door_bbox = _parse_bbox_arg(args.door_bbox)
     os.environ["BODY_DEBUG_VIS"] = str(args.debug_vis)
     clear_debug_folder()
     result = run_pipeline(
         image_path=args.image,
         age=args.age,
         gender=args.gender,
-        door_height_cm=args.door_height_cm,
-        door_bbox=door_bbox,
+        person_height_cm=args.person_height_cm,
+        person_weight_kg=args.person_weight_kg,
     )
     print(json.dumps(result, indent=2))
 

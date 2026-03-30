@@ -1,5 +1,6 @@
 from ultralytics import YOLO
 import joblib
+from vision.segmentation import HumanSegmenter
 
 
 class ModelLoader:
@@ -9,6 +10,7 @@ class ModelLoader:
         self.pose_model = None
         self.bodytype_model = None
         self.label_encoder = None
+        self.segmenter = None
 
     def load_models(self):
 
@@ -28,9 +30,14 @@ class ModelLoader:
             print("Loading label encoder...")
             self.label_encoder = joblib.load("label_encoder.pkl")
 
+        if self.segmenter is None:
+            print("Loading segmenter...")
+            self.segmenter = HumanSegmenter()
+
         return {
             "person_model": self.person_model,
             "pose_model": self.pose_model,
             "bodytype_model": self.bodytype_model,
-            "label_encoder": self.label_encoder
+            "label_encoder": self.label_encoder,
+            "segmenter": self.segmenter
         }

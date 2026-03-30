@@ -5,9 +5,10 @@ PROJECT EXTRACTION REPORT
 PROJECT STRUCTURE:
 --------------------------------------------------------------------------------
 
-body-measurement-api/
+body-type-api/
 ├── README.md
 ├── bodytype_model.pkl
+├── context.md
 ├── label_encoder.pkl
 ├── main.py
 ├── project_extract.py
@@ -19,18 +20,10 @@ body-measurement-api/
 ├── yolov8n.pt
 ├── api/
 ├── debug/
-│   ├── front_mask_overlay.png
-│   ├── front_person_detection.png
-│   ├── front_pose.png
-│   ├── front_segmentation_mask.png
-│   ├── front_segmentation_with_bbox.png
-│   ├── front_torso_rows.png
-│   ├── front_width_profile.png
-│   ├── side_mask_overlay.png
-│   ├── side_person_detection.png
-│   ├── side_pose.png
-│   ├── side_segmentation_mask.png
-│   └── side_segmentation_with_bbox.png
+│   ├── door_detection.png
+│   ├── person_detection.png
+│   ├── person_pose.png
+│   └── reference_overlay.png
 ├── docs/
 │   ├── Body Measurement System V2 Architecture.docx
 │   └── LLM IMPLEMENTATION SPECIFICATION.docx
@@ -47,7 +40,7 @@ body-measurement-api/
 ├── pipeline/
 │   └── measurement_pipeline.py
 ├── test/
-│   ├── front1.jpeg
+│   ├── front1.png
 │   ├── front2.jpeg
 │   ├── front3.jpeg
 │   ├── front4.jpeg
@@ -77,6 +70,7 @@ FILE: main.py
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import cv2
@@ -85,6 +79,8 @@ import os
 os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _resolve_image_path(path_str: str) -> Path:
@@ -112,36 +108,49 @@ def _load_image(path: Path):
     return image
 
 
-def run_pipeline(front_image_path: str, side_image_path: str, age: float, gender: float, height: float):
+def _parse_bbox_arg(bbox_text: str | None):
+    if not bbox_text:
+        return None
+
+    values = [item.strip() for item in bbox_text.split(",")]
+    if len(values) != 4:
+        raise ValueError("--door-bbox must be in format x1,y1,x2,y2")
+
+    x1, y1, x2, y2 = map(int, values)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("--door-bbox coordinates are invalid")
+
+    return (x1, y1, x2, y2)
+
+
+def run_pipeline(image_path: str, age: float, gender: float, door_height_cm: float, door_bbox=None):
     """Run the body measurement pipeline and return API-compatible output."""
     from models.model_loader import ModelLoader
     from pipeline.measurement_pipeline import MeasurementPipeline
 
-    front_path = _resolve_image_path(front_image_path)
-    side_path = _resolve_image_path(side_image_path)
+    source_path = _resolve_image_path(image_path)
 
-    front_img = _load_image(front_path)
-    side_img = _load_image(side_path)
+    image = _load_image(source_path)
 
     models = ModelLoader().load_models()
     pipeline = MeasurementPipeline(models)
 
     return pipeline.run(
-        front_image=front_img,
-        side_image=side_img,
+        image=image,
         age=age,
         gender=gender,
-        height=height,
+        door_real_height_cm=door_height_cm,
+        door_bbox_override=door_bbox,
     )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Body measurement pipeline CLI")
-    parser.add_argument("--front-image", default="test/front1.jpg", help="Front image path")
-    parser.add_argument("--side-image", default="test/side1.jpg", help="Side image path")
+    parser.add_argument("--image", default="test/front1.jpg", help="Image path containing person and door")
     parser.add_argument("--gender", type=float, default=1, help="Gender (0 or 1)")
     parser.add_argument("--age", type=float, default=20, help="Age in years")
-    parser.add_argument("--height", type=float, default=174, help="Total height in centimeters")
+    parser.add_argument("--door-height-cm", type=float, default=200.0, help="Known real-world door height in centimeters")
+    parser.add_argument("--door-bbox", default=None, help="Optional manual door bbox as x1,y1,x2,y2")
     parser.add_argument("--debug-vis", type=int, choices=[0, 1], default=1, help="Save debug visualizations (1=on, 0=off)")
     return parser.parse_args()
 
@@ -150,14 +159,15 @@ def main():
     from utils.debug_visualization import clear_debug_folder
 
     args = parse_args()
+    door_bbox = _parse_bbox_arg(args.door_bbox)
     os.environ["BODY_DEBUG_VIS"] = str(args.debug_vis)
     clear_debug_folder()
     result = run_pipeline(
-        front_image_path=args.front_image,
-        side_image_path=args.side_image,
+        image_path=args.image,
         age=args.age,
         gender=args.gender,
-        height=args.height,
+        door_height_cm=args.door_height_cm,
+        door_bbox=door_bbox,
     )
     print(json.dumps(result, indent=2))
 
@@ -552,24 +562,17 @@ FILE: pipeline/measurement_pipeline.py
 ================================================================================
 
 import os
+import math
 
-import cv2
-
-from utils.image_utils import validate_dual_images
+from utils.image_utils import validate_single_image
 from utils.debug_visualization import (
 	draw_bbox,
 	draw_pose,
-	draw_torso_lines,
-	overlay_mask,
-	plot_width_profile,
-	save_segmentation_with_bbox,
-	show_mask,
+	draw_reference_overlay,
 )
-from measurement.depth_estimation import compute_torso_circumferences, compute_torso_depths
 from measurement.feature_scaling import (
 	build_feature_vector as build_ml_feature_vector,
 )
-from measurement.height_measurement import compute_pixel_height
 from measurement.limb_measurements import (
 	compute_arm_length,
 	compute_leg_length,
@@ -577,14 +580,15 @@ from measurement.limb_measurements import (
 	compute_waist_to_knee,
 	distance,
 )
-from measurement.torso_measurements import (
-	compute_torso_widths,
-	compute_width_profile,
-	detect_torso_measurements,
+from vision.detection import (
+	bbox_center_x,
+	bbox_height,
+	bbox_width,
+	detect_door_heuristic,
+	detect_person,
+	is_bbox_fully_visible,
 )
-from vision.detection import detect_person
 from vision.pose import extract_pose_keypoints
-from vision.segmentation import HumanSegmenter
 
 
 class MeasurementPipeline:
@@ -594,209 +598,229 @@ class MeasurementPipeline:
 		self.pose_model = models["pose_model"]
 		self.bodytype_model = models["bodytype_model"]
 		self.label_encoder = models["label_encoder"]
-		self.segmenter = HumanSegmenter()
 
 	def _debug_visualization_enabled(self):
 		return os.getenv("BODY_DEBUG_VIS", "0") == "1"
 
 	def run(
 		self,
-		front_image,
-		side_image,
+		image,
 		age,
 		gender,
-		height
+		door_real_height_cm=200.0,
+		door_bbox_override=None,
 	):
 		"""
-		Main pipeline execution.
+		Main pipeline execution for door-reference scaling.
 		"""
 
-		# 1. Validate images
-		images = self.validate_images(front_image, side_image)
+		# 1. Validate input image
+		payload = self.validate_image(image)
+		frame = payload["image"]
 
-		# 2. Detect person
-		detected = self.detect_person(images)
+		# 2. Detect person and door in the same frame
+		detection = self.detect_entities(frame, door_bbox_override=door_bbox_override)
+		person_bbox = detection["person_bbox"]
+		door_bbox = detection["door_bbox"]
 
-		# 3. Segment body
-		segmented = self.segment_body(detected)
+		# 3. Guardrails for common geometric failures
+		self.validate_reference_geometry(frame, person_bbox, door_bbox)
 
-		# 4. Extract pose
-		pose_data = self.extract_pose(detected)
+		# 4. Extract pose from person crop
+		pose_data = self.extract_pose(detection["person_crop"])
+		front_pose = pose_data["front_pose"]
 
-		# 5. Compute measurements (pixel space)
+		# 5. Compute scale from known door height
+		door_height_px = float(bbox_height(door_bbox))
+		if door_height_px <= 0:
+			raise ValueError("Invalid door height in pixels")
+
+		scale_cm_per_px = float(door_real_height_cm / door_height_px)
+
+		# 6. Compute measurements in pixel space
 		measurements_pixels = self.compute_measurements(
-			segmented,
-			pose_data,
+			front_pose=front_pose,
+			person_bbox=person_bbox,
 		)
 
-		# 6. Compute pixel height
-		pixel_height = measurements_pixels["pixel_height"]
-
-		# 7. Compute scaling factor
-		scale = height / pixel_height
-
-		# 8. Scale measurements
+		# 7. Scale measurements into centimeters
 		scaled_measurements = {}
-
 		for key, value in measurements_pixels.items():
-
 			if key != "pixel_height":
-				scaled_measurements[key] = float(value * scale)
+				scaled_measurements[key] = float(value * scale_cm_per_px)
 
-		# 9. Compute body fat
+		person_height_cm = float(measurements_pixels["pixel_height"] * scale_cm_per_px)
+		scaled_measurements["height"] = person_height_cm
+
+		if self._debug_visualization_enabled():
+			draw_reference_overlay(
+				frame,
+				person_bbox=person_bbox,
+				door_bbox=door_bbox,
+				scale_cm_per_px=scale_cm_per_px,
+				estimated_height_cm=person_height_cm,
+				filename="reference_overlay.png",
+			)
+
+		# 8. Compute body fat from scaled waist and estimated height
 		waist = scaled_measurements["waist"]
-		body_fat = float(64 - (20 * waist / height))
+		body_fat = float(64 - (20 * waist / person_height_cm))
 
-		# 10. Build feature vector
+		# 9. Build feature vector
 		features = self.build_feature_vector(
 			gender,
 			age,
 			scaled_measurements,
-			height,
+			person_height_cm,
 			body_fat,
 		)
 
-		# 11. Predict body type
+		# 10. Predict body type
 		prediction = self.predict_body_type(features)
 
 		return {
 			"body_type": prediction["body_type"],
 			"ayurvedic_type": prediction["ayurvedic_type"],
-			"measurements": scaled_measurements
+			"measurements": scaled_measurements,
+			"meta": {
+				"method": "door_reference",
+				"scale_cm_per_px": scale_cm_per_px,
+				"door_height_px": door_height_px,
+				"person_height_px": float(measurements_pixels["pixel_height"]),
+				"detection_confidence": {
+					"person": float(detection["person_confidence"]),
+					"door": float(detection["door_confidence"]),
+				},
+			},
 		}
 
-	def validate_images(self, front_image, side_image):
+	def validate_image(self, image):
 		"""
-		Validate images before processing.
+		Validate image before processing.
 		"""
-		images = validate_dual_images(front_image, side_image)
+		payload = validate_single_image(image)
 
-		return images
+		return payload
 
-	def detect_person(self, images):
+	def detect_entities(self, image, door_bbox_override=None):
 		"""
-		Run YOLO person detection.
+		Run person and door detection on same frame.
 		"""
 
-		front_result = detect_person(
-			images["front"],
+		person_result = detect_person(
+			image,
 			self.person_model
 		)
 
-		side_result = detect_person(
-			images["side"],
-			self.person_model
-		)
+		if door_bbox_override is not None:
+			door_result = {
+				"bbox": tuple(door_bbox_override),
+				"crop": image[door_bbox_override[1]:door_bbox_override[3], door_bbox_override[0]:door_bbox_override[2]],
+				"confidence": 1.0,
+			}
+		else:
+			try:
+				door_result = detect_door_heuristic(
+					image
+				)
+			except ValueError as exc:
+				raise ValueError(
+					"Door detection failed. Provide --door-bbox x1,y1,x2,y2 or use an image with a clear full door"
+				) from exc
 
 		if self._debug_visualization_enabled():
-			draw_bbox(images["front"], front_result["bbox"], filename="front_person_detection.png")
-			draw_bbox(images["side"], side_result["bbox"], filename="side_person_detection.png")
+			draw_bbox(image, person_result["bbox"], filename="person_detection.png")
+			draw_bbox(image, door_result["bbox"], filename="door_detection.png")
 
 		return {
-			"front_crop": front_result["crop"],
-			"side_crop": side_result["crop"],
-			"front_bbox": front_result["bbox"],
-			"side_bbox": side_result["bbox"]
+			"person_crop": person_result["crop"],
+			"person_bbox": person_result["bbox"],
+			"person_confidence": person_result["confidence"],
+			"door_bbox": door_result["bbox"],
+			"door_confidence": door_result["confidence"],
 		}
 
-	def segment_body(self, images):
+	def validate_reference_geometry(self, image, person_bbox, door_bbox):
 		"""
-		Run segmentation model.
+		Reject frames that are likely to produce unstable scaling.
 		"""
 
-		front_mask = self.segmenter.segment(images["front_crop"])
-		side_mask = self.segmenter.segment(images["side_crop"])
+		if not is_bbox_fully_visible(door_bbox, image.shape):
+			raise ValueError("Door is not fully visible. Please capture full door in frame")
 
-		return {
-			"front_mask": front_mask,
-			"side_mask": side_mask,
-			"front_crop": images["front_crop"],
-			"side_crop": images["side_crop"]
-		}
+		if not is_bbox_fully_visible(person_bbox, image.shape):
+			raise ValueError("Person is not fully visible. Please capture full body in frame")
 
-	def extract_pose(self, images):
+		frame_width = float(image.shape[1])
+		person_center_x = bbox_center_x(person_bbox)
+		door_center_x = bbox_center_x(door_bbox)
+
+		if abs(person_center_x - door_center_x) > (0.35 * frame_width):
+			raise ValueError("Person appears too far from door. Keep person and door on same plane")
+
+		if bbox_height(door_bbox) <= bbox_height(person_bbox) * 0.5:
+			raise ValueError("Detected door looks too small. Move camera or frame the full door")
+
+	def extract_pose(self, person_crop):
 		"""
-		Extract pose keypoints.
+		Extract pose keypoints from person crop.
 		"""
 
 		front_pose = extract_pose_keypoints(
-			images["front_crop"],
-			self.pose_model
+			person_crop,
+			self.pose_model,
 		)
 
-		side_pose = extract_pose_keypoints(
-			images["side_crop"],
-			self.pose_model
-		)
+		if self._debug_visualization_enabled():
+			draw_pose(person_crop, front_pose, filename="person_pose.png")
 
 		return {
 			"front_pose": front_pose,
-			"side_pose": side_pose
 		}
 
-	def compute_measurements(self, segmentation_data, pose_data):
+	def _ellipse_circumference(self, width, depth):
 		"""
-		Compute anthropometric measurements.
+		Approximate torso circumference from width/depth ellipse.
 		"""
-		front_mask = segmentation_data["front_mask"]
-		side_mask = segmentation_data["side_mask"]
-		front_crop = segmentation_data["front_crop"]
-		side_crop = segmentation_data["side_crop"]
-		front_pose = pose_data["front_pose"]
-		side_pose = pose_data["side_pose"]
-		debug_vis = self._debug_visualization_enabled()
 
-		if debug_vis:
-			show_mask(front_mask, filename="front_segmentation_mask.png")
-			show_mask(side_mask, filename="side_segmentation_mask.png")
-			overlay_mask(front_crop, front_mask, filename="front_mask_overlay.png")
-			overlay_mask(side_crop, side_mask, filename="side_mask_overlay.png")
-			save_segmentation_with_bbox(front_crop, front_mask, filename="front_segmentation_with_bbox.png")
-			save_segmentation_with_bbox(side_crop, side_mask, filename="side_segmentation_with_bbox.png")
-			draw_pose(front_crop, front_pose, filename="front_pose.png")
-			draw_pose(side_crop, side_pose, filename="side_pose.png")
+		a = max(float(width), 1.0) / 2.0
+		b = max(float(depth), 1.0) / 2.0
 
-		pixel_height, _, _ = compute_pixel_height(front_mask)
+		return math.pi * (3.0 * (a + b) - math.sqrt((3.0 * a + b) * (a + 3.0 * b)))
 
-		# Extract shoulder/hip pixel coordinates from pose for anatomy-guided scanning.
-		left_shoulder_x = min(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
-		right_shoulder_x = max(float(front_pose["left_shoulder"][0]), float(front_pose["right_shoulder"][0]))
-		pose_shoulder_y = float((front_pose["left_shoulder"][1] + front_pose["right_shoulder"][1]) / 2)
-		pose_hip_y = float((front_pose["left_hip"][1] + front_pose["right_hip"][1]) / 2)
-
-		width_profile = compute_width_profile(front_mask, left_shoulder_x, right_shoulder_x)
-		chest_y, waist_y, hip_y = detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y)
-
-		if debug_vis:
-			draw_torso_lines(front_crop, chest_y, waist_y, hip_y, filename="front_torso_rows.png")
-			plot_width_profile(width_profile, filename="front_width_profile.png")
-
-		torso_widths = compute_torso_widths(front_mask, left_shoulder_x, right_shoulder_x, pose_shoulder_y, pose_hip_y)
-		torso_depths = compute_torso_depths(side_mask, chest_y, waist_y, hip_y)
-		torso_circumferences = compute_torso_circumferences(torso_widths, torso_depths)
+	def compute_measurements(self, front_pose, person_bbox):
+		"""
+		Compute measurements in pixel space from pose and person bbox.
+		"""
+		pixel_height = float(bbox_height(person_bbox))
+		if pixel_height <= 0:
+			raise ValueError("Invalid person height in pixels")
 
 		shoulder_width = distance(
 			front_pose["left_shoulder"],
 			front_pose["right_shoulder"],
 		)
 
-		chest = torso_circumferences["chest_pixels"]
+		person_width = float(bbox_width(person_bbox))
+
+		chest_width = max(shoulder_width * 1.18, person_width * 0.42)
+		waist_width = max(chest_width * 0.88, person_width * 0.36)
+		hip_width = max(waist_width * 1.06, person_width * 0.40)
+
+		chest = self._ellipse_circumference(chest_width, chest_width * 0.68)
+		waist = self._ellipse_circumference(waist_width, waist_width * 0.72)
+		hips = self._ellipse_circumference(hip_width, hip_width * 0.74)
+
 		if chest > 2 * shoulder_width:
 			chest = shoulder_width * 1.5
-
-		print("pixel height:", pixel_height)
-		print("chest_y waist_y hip_y:", chest_y, waist_y, hip_y)
-		print("torso_widths:", torso_widths)
-		print("torso_depths:", torso_depths)
-		print("circumferences:", torso_circumferences)
 
 		measurements_pixels = {
 			"pixel_height": float(pixel_height),
 			"shoulder_width": shoulder_width,
 			"chest": chest,
-			"waist": torso_circumferences["waist_pixels"],
-			"hips": torso_circumferences["hips_pixels"],
-			"belly": torso_circumferences["waist_pixels"] * 1.1,
+			"waist": waist,
+			"hips": hips,
+			"belly": waist * 1.1,
 			"arm_length": compute_arm_length(front_pose),
 			"shoulder_to_waist": compute_shoulder_to_waist(front_pose),
 			"waist_to_knee": compute_waist_to_knee(front_pose),
@@ -1027,17 +1051,34 @@ if __name__ == "__main__":
 FILE: test.py
 ================================================================================
 
-from ultralytics import YOLO
+import argparse
+
 import cv2
-from vision.detection import detect_person
+from ultralytics import YOLO
 
-model = YOLO("yolov8n.pt")
+from vision.detection import detect_door_heuristic, detect_person
 
-img = cv2.imread("image.jpg")
 
-result = detect_person(img, model)
+def main():
+	parser = argparse.ArgumentParser(description="Quick local detection check")
+	parser.add_argument("--image", required=True, help="Path to image containing person and door")
+	args = parser.parse_args()
 
-print(result["bbox"])
+	image = cv2.imread(args.image, cv2.IMREAD_COLOR)
+	if image is None:
+		raise ValueError(f"Failed to load image: {args.image}")
+
+	model = YOLO("yolov8n.pt")
+
+	person = detect_person(image, model)
+	door = detect_door_heuristic(image)
+
+	print("person_bbox:", person["bbox"], "conf:", round(person["confidence"], 4))
+	print("door_bbox:", door["bbox"], "conf:", round(door["confidence"], 4))
+
+
+if __name__ == "__main__":
+	main()
 
 ================================================================================
 FILE: tmp_smoke_test.py
@@ -1113,6 +1154,53 @@ def draw_bbox(image, bbox, filename="person_detection.png"):
 
     _save(filename, img)
     _show("Person Detection", img)
+
+
+def draw_reference_overlay(
+    image,
+    person_bbox,
+    door_bbox,
+    scale_cm_per_px,
+    estimated_height_cm,
+    filename="reference_overlay.png",
+):
+    """Draw person + door boxes and reference scaling summary on one frame."""
+    img = image.copy()
+
+    px1, py1, px2, py2 = person_bbox
+    dx1, dy1, dx2, dy2 = door_bbox
+
+    cv2.rectangle(img, (px1, py1), (px2, py2), (60, 220, 60), 3)
+    cv2.rectangle(img, (dx1, dy1), (dx2, dy2), (60, 160, 255), 3)
+
+    cv2.putText(img, "Person", (px1, max(py1 - 10, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 220, 60), 2)
+    cv2.putText(img, "Door", (dx1, max(dy1 - 10, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 160, 255), 2)
+
+    door_height_px = max(dy2 - dy1, 1)
+    person_height_px = max(py2 - py1, 1)
+
+    summary_lines = [
+        f"scale: {scale_cm_per_px:.4f} cm/px",
+        f"door height: {door_height_px} px",
+        f"person height: {person_height_px} px",
+        f"estimated height: {estimated_height_cm:.1f} cm",
+    ]
+
+    x0 = 14
+    y0 = 28
+    line_h = 24
+
+    panel_w = 430
+    panel_h = 18 + line_h * len(summary_lines)
+    cv2.rectangle(img, (x0 - 8, y0 - 18), (x0 - 8 + panel_w, y0 - 18 + panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (x0 - 8, y0 - 18), (x0 - 8 + panel_w, y0 - 18 + panel_h), (230, 230, 230), 1)
+
+    for idx, line in enumerate(summary_lines):
+        y = y0 + (idx * line_h)
+        cv2.putText(img, line, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+
+    _save(filename, img)
+    _show("Reference Overlay", img)
 
 
 def show_mask(mask, filename="segmentation_mask.png"):
@@ -1232,6 +1320,18 @@ def validate_image(image):
     return True
 
 
+def validate_single_image(image):
+    """
+    Validate and return a single image payload.
+    """
+
+    validate_image(image)
+
+    return {
+        "image": image
+    }
+
+
 def validate_dual_images(front_image, side_image):
     """
     Validate both front and side images.
@@ -1276,40 +1376,191 @@ FILE: vision/detection.py
 ================================================================================
 
 import cv2
+import numpy as np
 
 
-def detect_person(image, model):
+PERSON_CLASS_ID = 0
+
+
+def bbox_height(bbox):
+    x1, y1, x2, y2 = bbox
+    _ = x1
+    _ = x2
+    return max(0, int(y2 - y1))
+
+
+def bbox_width(bbox):
+    x1, y1, x2, y2 = bbox
+    _ = y1
+    _ = y2
+    return max(0, int(x2 - x1))
+
+
+def bbox_center_x(bbox):
+    x1, _, x2, _ = bbox
+    return float(x1 + x2) / 2.0
+
+
+def is_bbox_fully_visible(bbox, image_shape, margin=2):
+    height, width = image_shape[:2]
+    x1, y1, x2, y2 = bbox
+
+    return (
+        x1 > margin
+        and y1 > margin
+        and x2 < (width - margin)
+        and y2 < (height - margin)
+    )
+
+
+def _clip_bbox(bbox, image_shape):
+    height, width = image_shape[:2]
+    x1, y1, x2, y2 = bbox
+
+    x1 = max(0, min(int(x1), width - 1))
+    y1 = max(0, min(int(y1), height - 1))
+    x2 = max(x1 + 1, min(int(x2), width))
+    y2 = max(y1 + 1, min(int(y2), height))
+
+    return (x1, y1, x2, y2)
+
+
+def detect_person(image, model, min_confidence=0.25):
     """
-    Detect person using YOLOv8 and return bounding box and cropped image.
+    Detect the most confident person box using YOLO class filtering.
     """
 
-    results = model(image)
+    results = model(image, verbose=False)
 
-    person_bbox = None
+    best_bbox = None
+    best_conf = -1.0
 
     for r in results:
-        boxes = r.boxes.xyxy
+        if r.boxes is None or len(r.boxes) == 0:
+            continue
 
-        if boxes is None or len(boxes) == 0:
-            raise ValueError("No person detected")
+        boxes = r.boxes.xyxy.cpu().numpy()
+        classes = r.boxes.cls.cpu().numpy().astype(int)
+        confidences = r.boxes.conf.cpu().numpy()
 
-        # Take first detected person
-        x1, y1, x2, y2 = map(int, boxes[0][:4])
+        for idx, cls_id in enumerate(classes):
+            conf = float(confidences[idx])
+            if cls_id != PERSON_CLASS_ID or conf < min_confidence:
+                continue
 
-        person_bbox = (x1, y1, x2, y2)
+            bbox = tuple(map(int, boxes[idx][:4]))
+            bbox = _clip_bbox(bbox, image.shape)
+            if conf > best_conf:
+                best_conf = conf
+                best_bbox = bbox
 
-        break
+    if best_bbox is None:
+        raise ValueError("No person detected")
 
-    if person_bbox is None:
-        raise ValueError("Person detection failed")
-
-    x1, y1, x2, y2 = person_bbox
-
+    x1, y1, x2, y2 = best_bbox
     person_crop = image[y1:y2, x1:x2]
 
     return {
-        "bbox": person_bbox,
-        "crop": person_crop
+        "bbox": best_bbox,
+        "crop": person_crop,
+        "confidence": float(best_conf),
+    }
+
+
+def detect_door_heuristic(image):
+    """
+    Detect a door-like vertical rectangle using OpenCV contour heuristics.
+    """
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blurred, 45, 140)
+    edge_kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, edge_kernel, iterations=2)
+    edges = cv2.erode(edges, edge_kernel, iterations=1)
+
+    # Also use threshold-based regions so clean rectangular doors survive when
+    # contour edges are fragmented.
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    thresh = cv2.morphologyEx(
+        thresh,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), np.uint8),
+        iterations=1,
+    )
+
+    merged = cv2.bitwise_or(edges, thresh)
+
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No door-like region found")
+
+    img_h, img_w = image.shape[:2]
+    img_area = float(img_h * img_w)
+
+    best_bbox = None
+    best_score = -1.0
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 35 or h < 140:
+            continue
+
+        area = float(w * h)
+        area_ratio = area / max(img_area, 1.0)
+        if area_ratio < 0.008:
+            continue
+
+        aspect_ratio = float(h) / float(max(w, 1))
+        if aspect_ratio < 1.8 or aspect_ratio > 8.0:
+            continue
+
+        contour_area = float(cv2.contourArea(contour))
+        rectangularity = contour_area / max(area, 1.0)
+        if rectangularity < 0.06:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+        quad_bonus = 0.25 if len(approx) in (4, 5) else 0.0
+
+        vertical_coverage = float(h) / float(max(img_h, 1))
+        center_x = x + (w / 2.0)
+        center_bias = 1.0 - min(abs(center_x - (img_w / 2.0)) / (img_w / 2.0), 1.0)
+
+        score = (
+            (area_ratio * 1.8)
+            + min(aspect_ratio / 4.0, 1.0)
+            + min(rectangularity, 1.0)
+            + (vertical_coverage * 1.2)
+            + (center_bias * 0.35)
+            + quad_bonus
+        )
+        if score > best_score:
+            best_score = score
+            best_bbox = (x, y, x + w, y + h)
+
+    if best_bbox is None:
+        raise ValueError("Door detection failed")
+
+    best_bbox = _clip_bbox(best_bbox, image.shape)
+    x1, y1, x2, y2 = best_bbox
+    door_crop = image[y1:y2, x1:x2]
+
+    confidence = float(min(max(best_score / 3.0, 0.0), 1.0))
+
+    return {
+        "bbox": best_bbox,
+        "crop": door_crop,
+        "confidence": confidence,
     }
 
 
