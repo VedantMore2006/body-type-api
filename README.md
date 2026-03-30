@@ -1,79 +1,56 @@
-# Body Measurement Pipeline (Door Reference Baseline)
+# Body Measurement & Ayurvedic Body Type API
 
-This project estimates body measurements from a single image using a known-height door as the reference object.
+This project estimates body measurements and predicts Ayurvedic body types (Vata, Pitta, Kapha) from a single front-facing image using the user's known height and weight as calibration references.
 
-## Current Baseline
+## Current System (Version 2.0 - Scientific Scaling)
 
-- Input: one image containing both person and door.
-- Person detection: YOLOv8 (`yolov8n.pt`).
-- Door detection: OpenCV contour-based vertical rectangle heuristic.
-- Scale: `cm_per_pixel = door_real_height_cm / door_height_px`.
-- Height estimate: `person_height_cm = person_height_px * cm_per_pixel`.
-- Additional measurements: pose-based limb distances and heuristic torso circumferences, all scaled by the same factor.
+- **Input**: One front-facing image, height (cm), weight (kg), age, and gender.
+- **Person Detection**: YOLOv8 (`yolov8n.pt`) for localization.
+- **Pose Estimation**: YOLOv8-pose (`yolov8n-pose.pt`) for skeletal landmarking.
+- **Body Segmentation**: MediaPipe `SelfieSegmentation` for pixel-perfect silhouette extraction.
+- **Scaling Logic**: `cm_per_pixel = user_height_cm / silhouette_pixel_height`.
+- **Dynamic Depth**: Torso circumferences (chest, waist, hips) are calculated using the Ramanujan ellipse approximation, where depth is dynamically estimated based on the user's **Body Mass Index (BMI)** and gender proportions.
+- **Body Type Classification**: A Random Forest model predicts Western body types (Ectomorph, Mesomorph, Endomorph) which are then mapped to Ayurvedic Doshas.
 
-## Why This Baseline
+## Why This Approach
 
-The goal is to ship a simple and fast reference-object approach first, then iterate on robustness.
+By using the user's actual height for scaling, we eliminate the perspective distortion errors inherent in door-reference or A4-sheet methods. The integration of weight and BMI allows for realistic 3D volume estimation (depth) from a single 2D image.
 
-## Limitations
-
-- Door detector is heuristic and may fail in cluttered scenes.
-- Perspective and depth mismatch can distort scale.
-- Camera tilt can bias vertical pixel measurements.
-- Torso circumferences are approximations in this phase.
-
-## Run Locally
+## Getting Started
 
 ### Prerequisites
 
-- Python environment with dependencies from `requirements.txt`
-- Model files:
-   - `yolov8n.pt`
-   - `yolov8n-pose.pt`
-   - `bodytype_model.pkl`
-   - `label_encoder.pkl`
+- Python 3.9+
+- Dependencies: `pip install -r requirements.txt` (includes `mediapipe`, `ultralytics`, `scipy`, etc.)
+- Weights: `yolov8n.pt`, `yolov8n-pose.pt`, `bodytype_model.pkl`, `label_encoder.pkl`
 
-### Command
+### Command Line Interface
 
 ```bash
 python main.py \
-   --image test/front1.jpg \
-   --door-height-cm 200 \
-   --age 24 \
+   --image test/front1.png \
+   --person-height-cm 180 \
+   --person-weight-kg 75 \
+   --age 25 \
    --gender 1 \
-   --debug-vis 0
-```
-
-If automatic door detection fails, provide the door region manually:
-
-```bash
-python main.py \
-   --image test/front1.jpg \
-   --door-height-cm 200 \
-   --door-bbox 120,40,310,980 \
-   --age 24 \
-   --gender 1 \
-   --debug-vis 0
+   --debug-vis 1
 ```
 
 ## Output
 
-The pipeline returns:
+The pipeline returns a JSON object:
 
-- `body_type`
-- `ayurvedic_type`
-- `measurements` (including estimated `height` in cm)
-- `meta` (method, scale, pixel heights, detection confidences)
+- `body_type`: (Ectomorph, Mesomorph, Endomorph)
+- `ayurvedic_type`: (Vata, Pitta, Kapha)
+- `measurements`: (height, shoulder_width, chest, waist, hips, belly, arm_length, leg_length, etc. in cm)
+- `meta`: (scaling factor, pixel metrics, detection confidence)
 
-When `--debug-vis 1` is enabled, debug images are saved in `debug/`, including:
+When `--debug-vis 1` is enabled, check the `debug/` folder for:
+- `scaling_overlay.png`: Visual verification of the person height scaling.
+- `segmentation_mask.png`: The silhouette used for width extraction.
+- `person_pose.png`: YOLO skeletal keypoints.
+- `torso_rows.png`: Highlights where the chest, waist, and hip rows were detected.
 
-- `person_detection.png`
-- `door_detection.png`
-- `person_pose.png`
-- `reference_overlay.png` (person + door boxes with scale and estimated height)
+## Technical Documentation
 
-## Next Up
-
-- Add a trained door detector as a fallback/upgrade path.
-- Add frame quality confidence and stricter rejection rules.
-- Add multi-frame smoothing for stability.
+For a detailed breakdown of the models, mathematical formulas, and accuracy considerations, see [docs/technical_specification.md](docs/technical_specification.md).
