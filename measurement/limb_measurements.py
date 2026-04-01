@@ -27,6 +27,24 @@ def compute_leg_length(pose):
     return max(left, right)
 
 
+def compute_leg_length_to_floor(pose, mask_bottom_y):
+    """
+    Measures from hip to floor for barefoot subjects.
+    """
+    
+    left_hip_to_knee = distance(pose["left_hip"], pose["left_knee"])
+    right_hip_to_knee = distance(pose["right_hip"], pose["right_knee"])
+    
+    # Distance from knee to floor in pixels
+    left_knee_to_floor = abs(mask_bottom_y - pose["left_knee"][1])
+    right_knee_to_floor = abs(mask_bottom_y - pose["right_knee"][1])
+    
+    left = left_hip_to_knee + left_knee_to_floor
+    right = right_hip_to_knee + right_knee_to_floor
+    
+    return max(left, right)
+
+
 def compute_shoulder_to_waist(pose):
 
     shoulder_mid = (

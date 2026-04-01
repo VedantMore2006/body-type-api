@@ -37,13 +37,13 @@ class HumanSegmenter:
         if mask is None:
             raise ValueError("Segmentation failed")
 
-        # Convert to binary mask
-        binary_mask = (mask > 0.5).astype(np.uint8)
+        # Convert to binary mask with a lower threshold for low-contrast images
+        binary_mask = (mask > 0.1).astype(np.uint8)
 
-        # Morphological smoothing to remove noise
-        kernel = np.ones((5, 5), np.uint8)
+        # Morphological close to fill holes and gaps in clothing/torso
+        # Reduced OPEN to avoid erasing thin/dark regions like the waist
+        kernel = np.ones((7, 7), np.uint8)
         binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
-        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
 
         return binary_mask
 

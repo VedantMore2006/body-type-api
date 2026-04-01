@@ -63,6 +63,20 @@ def run_pipeline(image_path: str, age: float, gender: float, person_height_cm: f
     )
 
 
+def generate_infographic_report(result, person_height_cm, person_weight_kg):
+    """Generate the final premium results image."""
+    from utils.report_generator import ReportGenerator
+    
+    gen = ReportGenerator(output_path="Final_Result_Infographic.png")
+    gen.generate(
+        measurements=result["measurements"],
+        body_type=result["body_type"],
+        ayurvedic_type=result["ayurvedic_type"],
+        person_height_cm=person_height_cm,
+        person_weight_kg=person_weight_kg
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Body measurement pipeline CLI")
     parser.add_argument("--image", default="test/front1.jpg", help="Image path containing person and door")
@@ -87,6 +101,10 @@ def main():
         person_height_cm=args.person_height_cm,
         person_weight_kg=args.person_weight_kg,
     )
+    
+    # Generate the premium report
+    generate_infographic_report(result, args.person_height_cm, args.person_weight_kg)
+    
     print(json.dumps(result, indent=2))
 
 

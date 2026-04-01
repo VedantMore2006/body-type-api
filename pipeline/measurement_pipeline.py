@@ -14,6 +14,7 @@ from measurement.feature_scaling import (
 from measurement.limb_measurements import (
 	compute_arm_length,
 	compute_leg_length,
+	compute_leg_length_to_floor,
 	compute_shoulder_to_waist,
 	compute_waist_to_knee,
 	distance,
@@ -73,23 +74,30 @@ class MeasurementPipeline:
 		if self._debug_visualization_enabled():
 			show_mask(person_mask)
 
-		# 5. Compute scale from known person height
-		person_height_px = float(bbox_height(person_bbox))
+		# 5. Compute tilt and vertical correction
+		tilt_angle = self._detect_tilt(front_pose)
+		v_factor = self._get_vertical_correction_factor(tilt_angle)
+
+		# 6. Compute scale from known person height
+		# Apply vertical factor to the pixel height to get the 'straight' pixel height
+		person_height_px = float(bbox_height(person_bbox)) * v_factor
 		if person_height_px <= 0:
 			raise ValueError("Invalid person height in pixels")
 
 		scale_cm_per_px = float(person_height_cm / person_height_px)
 
-		# 6. Compute measurements in pixel space using mask bounds and BMI depth
+		# 7. Compute measurements in pixel space using mask bounds and BMI depth
 		measurements_pixels = self.compute_measurements(
 			front_pose=front_pose,
 			person_bbox=person_bbox,
 			mask=person_mask,
 			person_weight_kg=person_weight_kg,
-			person_height_cm=person_height_cm
+			person_height_cm=person_height_cm,
+			gender=gender,
+			v_factor=v_factor
 		)
 
-		# 7. Scale measurements into centimeters
+		# 8. Scale measurements into centimeters
 		scaled_measurements = {}
 		for key, value in measurements_pixels.items():
 			if key != "pixel_height":
@@ -106,11 +114,11 @@ class MeasurementPipeline:
 				filename="scaling_overlay.png",
 			)
 
-		# 8. Compute body fat from scaled waist and known height
+		# 9. Compute body fat from scaled waist and known height
 		waist = scaled_measurements["waist"]
 		body_fat = float(64 - (20 * waist / person_height_cm))
 
-		# 9. Build feature vector
+		# 10. Build feature vector
 		features = self.build_feature_vector(
 			gender,
 			age,
@@ -119,7 +127,7 @@ class MeasurementPipeline:
 			body_fat,
 		)
 
-		# 10. Predict body type
+		# 11. Predict body type
 		prediction = self.predict_body_type(features)
 
 		return {
@@ -130,6 +138,7 @@ class MeasurementPipeline:
 				"method": "height_reference",
 				"scale_cm_per_px": scale_cm_per_px,
 				"person_height_px": person_height_px,
+				"tilt_angle_deg": math.degrees(tilt_angle),
 				"detection_confidence": {
 					"person": float(detection["person_confidence"]),
 				},
@@ -188,6 +197,29 @@ class MeasurementPipeline:
 			"front_pose": front_pose,
 		}
 
+	def _detect_tilt(self, pose):
+		"""
+		Detect camera tilt using Nose-to-Hip verticality.
+		Returns angle in radians.
+		"""
+		nose = pose["nose"]
+		mid_hip = (
+			(pose["left_hip"][0] + pose["right_hip"][0]) / 2.0,
+			(pose["left_hip"][1] + pose["right_hip"][1]) / 2.0
+		)
+		
+		dx = nose[0] - mid_hip[0]
+		dy = nose[1] - mid_hip[1]
+		
+		angle = math.atan2(abs(dx), abs(dy))
+		return angle
+
+	def _get_vertical_correction_factor(self, tilt_angle):
+		"""
+		Returns 1/cos(theta) correction factor.
+		"""
+		return 1.0 / math.cos(tilt_angle)
+
 	def _ellipse_circumference(self, width, depth):
 		"""
 		Approximate torso circumference from width/depth ellipse.
@@ -198,44 +230,71 @@ class MeasurementPipeline:
 
 		return math.pi * (3.0 * (a + b) - math.sqrt((3.0 * a + b) * (a + 3.0 * b)))
 
-	def compute_measurements(self, front_pose, person_bbox, mask, person_weight_kg, person_height_cm):
+	def compute_measurements(self, front_pose, person_bbox, mask, person_weight_kg, person_height_cm, gender, v_factor):
 		"""
 		Compute measurements in pixel space from pose, person bbox, and generated mask.
 		"""
 		from measurement.torso_measurements import compute_torso_widths
 
-		pixel_height = float(bbox_height(person_bbox))
+		pixel_height = float(bbox_height(person_bbox)) * v_factor
 		if pixel_height <= 0:
 			raise ValueError("Invalid person height in pixels")
-
-		shoulder_width = distance(
-			front_pose["left_shoulder"],
-			front_pose["right_shoulder"],
-		)
 
 		torso_widths = compute_torso_widths(
 			mask=mask,
 			left_shoulder_x=min(front_pose["left_shoulder"][0], front_pose["right_shoulder"][0]),
 			right_shoulder_x=max(front_pose["left_shoulder"][0], front_pose["right_shoulder"][0]),
+			left_hip_x=min(front_pose["left_hip"][0], front_pose["right_hip"][0]),
+			right_hip_x=max(front_pose["left_hip"][0], front_pose["right_hip"][0]),
 			pose_shoulder_y=min(front_pose["left_shoulder"][1], front_pose["right_shoulder"][1]),
 			pose_hip_y=max(front_pose["left_hip"][1], front_pose["right_hip"][1])
 		)
 
-		chest_width = torso_widths["chest_width_pixels"]
-		waist_width = torso_widths["waist_width_pixels"]
-		hip_width = torso_widths["hip_width_pixels"]
+		joint_shoulder_width = distance(front_pose["left_shoulder"], front_pose["right_shoulder"])
+		joint_hip_width = distance(front_pose["left_hip"], front_pose["right_hip"])
+		
+		# Proportional fallbacks for robustness against poor segmentation
+		# Shoulders: Deltoids usually extend ~15% past skeletal joints
+		shoulder_width = max(torso_widths["mask_shoulder_width_pixels"], joint_shoulder_width * 1.25)
+		
+		# Chest: Usually 1.1x skeletal shoulder width
+		chest_width = max(torso_widths["chest_width_pixels"], joint_shoulder_width * 1.15)
+		
+		# Waist: Adult male waist width is usually at least 65-70% of shoulder width
+		# We also use the hip joint as a base reference.
+		waist_width = max(torso_widths["waist_width_pixels"], shoulder_width * 0.7, joint_hip_width * 1.1)
+		
+		# Hips: Usually 1.2x skeletal hip distance OR at least as wide as the waist
+		hip_width = max(torso_widths["hip_width_pixels"], waist_width, joint_hip_width * 1.2)
 
-		# Dynamic BMI depth ratio
+		# Clothing Factor subtraction (approx 1.5cm / 5%)
+		clothing_reduction = 0.96
+		chest_width *= clothing_reduction
+		waist_width *= clothing_reduction
+		hip_width *= clothing_reduction
+
+		# BMI-based depth ratio calibration
 		bmi = person_weight_kg / ((person_height_cm / 100.0) ** 2)
-		depth_ratio = 0.65 + (max(0, bmi - 22) * 0.012)
+		
+		# Gender-specific base depth calibration
+		if gender == 1: # Male
+			base_depth = 0.72
+			bmi_mult = 0.015
+		else: # Female
+			base_depth = 0.65
+			bmi_mult = 0.012
+			
+		# Allow leaner ratio for BMI < 22
+		if bmi < 22:
+			depth_ratio = base_depth - (22 - bmi) * 0.075
+		else:
+			depth_ratio = base_depth + (max(0, bmi - 22) * bmi_mult)
+			
 		depth_ratio = min(max(depth_ratio, 0.45), 0.95)
 
-		chest = self._ellipse_circumference(chest_width, chest_width * depth_ratio)
+		chest = self._ellipse_circumference(chest_width, chest_width * (depth_ratio + 0.05)) # Chest is deeper
 		waist = self._ellipse_circumference(waist_width, waist_width * depth_ratio)
-		hips = self._ellipse_circumference(hip_width, hip_width * depth_ratio)
-
-		if chest > 2 * shoulder_width:
-			chest = shoulder_width * 1.5
+		hips = self._ellipse_circumference(hip_width, hip_width * (depth_ratio - 0.03)) # Hips generally flatter
 
 		measurements_pixels = {
 			"pixel_height": float(pixel_height),
@@ -245,9 +304,9 @@ class MeasurementPipeline:
 			"hips": hips,
 			"belly": waist * 1.1,
 			"arm_length": compute_arm_length(front_pose),
-			"shoulder_to_waist": compute_shoulder_to_waist(front_pose),
-			"waist_to_knee": compute_waist_to_knee(front_pose),
-			"leg_length": compute_leg_length(front_pose),
+			"shoulder_to_waist": compute_shoulder_to_waist(front_pose) * v_factor,
+			"waist_to_knee": compute_waist_to_knee(front_pose) * v_factor,
+			"leg_length": compute_leg_length_to_floor(front_pose, mask.shape[0]) * v_factor,
 		}
 
 		return measurements_pixels

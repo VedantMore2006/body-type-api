@@ -19,6 +19,9 @@ def extract_pose_keypoints(image, pose_model):
         k = keypoints[0]
 
         pose_data = {
+            "nose": k[0],
+            "left_eye": k[1],
+            "right_eye": k[2],
             "left_shoulder": k[5],
             "right_shoulder": k[6],
 
