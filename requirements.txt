@@ -8,3 +8,6 @@ torchvision
 matplotlib
 mediapipe
 scipy
+fastapi
+uvicorn
+python-multipart

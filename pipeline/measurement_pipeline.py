@@ -133,16 +133,6 @@ class MeasurementPipeline:
 		return {
 			"body_type": prediction["body_type"],
 			"ayurvedic_type": prediction["ayurvedic_type"],
-			"measurements": scaled_measurements,
-			"meta": {
-				"method": "height_reference",
-				"scale_cm_per_px": scale_cm_per_px,
-				"person_height_px": person_height_px,
-				"tilt_angle_deg": math.degrees(tilt_angle),
-				"detection_confidence": {
-					"person": float(detection["person_confidence"]),
-				},
-			},
 		}
 
 	def validate_image(self, image):
