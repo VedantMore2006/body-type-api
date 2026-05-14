@@ -39,6 +39,11 @@ def check_lighting(image: np.ndarray) -> bool:
         return False
     return True
 
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
 @app.post("/predict")
 async def predict_body_type(
     image: UploadFile = File(...),
@@ -48,9 +53,16 @@ async def predict_body_type(
     person_weight_kg: float = Form(...),
 ):
     try:
+        # File extension validation
+        if not image.filename or not allowed_file(image.filename):
+            raise ValueError(f"Invalid file extension. Allowed extensions are: {', '.join(ALLOWED_EXTENSIONS)}")
+
         # Read the uploaded file into a byte array
         contents = await image.read()
         
+        if not contents:
+            raise ValueError("The uploaded file is empty.")
+
         # Decode the image via OpenCV
         nparr = np.frombuffer(contents, np.uint8)
         img_cv2 = cv2.imdecode(nparr, cv2.IMREAD_COLOR)

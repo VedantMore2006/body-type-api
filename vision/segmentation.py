@@ -35,7 +35,7 @@ class HumanSegmenter:
         mask = results.segmentation_mask
 
         if mask is None:
-            raise ValueError("Segmentation failed")
+            raise ValueError("Body segmentation failed. Ensure the person stands out clearly against the background.")
 
         # Convert to binary mask with a lower threshold for low-contrast images
         binary_mask = (mask > 0.1).astype(np.uint8)
@@ -58,7 +58,7 @@ class HumanSegmenter:
         # Keep the largest foreground component to approximate the human silhouette.
         contours, _ = cv2.findContours((mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            raise ValueError("Segmentation failed")
+            raise ValueError("Body segmentation failed. Ensure the person stands out clearly against the background.")
 
         largest = max(contours, key=cv2.contourArea)
         binary_mask = np.zeros_like(mask, dtype=np.uint8)

@@ -82,7 +82,7 @@ class MeasurementPipeline:
 		# Apply vertical factor to the pixel height to get the 'straight' pixel height
 		person_height_px = float(bbox_height(person_bbox)) * v_factor
 		if person_height_px <= 0:
-			raise ValueError("Invalid person height in pixels")
+			raise ValueError("Invalid person height detected in the image. Ensure the person is standing clearly in the frame.")
 
 		scale_cm_per_px = float(person_height_cm / person_height_px)
 
@@ -228,7 +228,7 @@ class MeasurementPipeline:
 
 		pixel_height = float(bbox_height(person_bbox)) * v_factor
 		if pixel_height <= 0:
-			raise ValueError("Invalid person height in pixels")
+			raise ValueError("Invalid person height detected in the image. Ensure the person is standing clearly in the frame.")
 
 		torso_widths = compute_torso_widths(
 			mask=mask,

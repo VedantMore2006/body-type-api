@@ -57,6 +57,7 @@ def detect_person(image, model, min_confidence=0.25):
 
     best_bbox = None
     best_conf = -1.0
+    other_objects_detected = False
 
     for r in results:
         if r.boxes is None or len(r.boxes) == 0:
@@ -68,7 +69,11 @@ def detect_person(image, model, min_confidence=0.25):
 
         for idx, cls_id in enumerate(classes):
             conf = float(confidences[idx])
-            if cls_id != PERSON_CLASS_ID or conf < min_confidence:
+            if conf < min_confidence:
+                continue
+                
+            if cls_id != PERSON_CLASS_ID:
+                other_objects_detected = True
                 continue
 
             bbox = tuple(map(int, boxes[idx][:4]))
@@ -78,7 +83,10 @@ def detect_person(image, model, min_confidence=0.25):
                 best_bbox = bbox
 
     if best_bbox is None:
-        raise ValueError("No person detected")
+        if other_objects_detected:
+            raise ValueError("It looks like you uploaded a random image. We couldn't find a person in it. Please politely upload a clear image of yourself standing.")
+        else:
+            raise ValueError("No person detected in the image. Please ensure the person is clearly visible.")
 
     x1, y1, x2, y2 = best_bbox
     person_crop = image[y1:y2, x1:x2]

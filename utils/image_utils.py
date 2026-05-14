@@ -8,21 +8,21 @@ def validate_image(image):
     """
 
     if image is None:
-        raise ValueError("Image decoding failed")
+        raise ValueError("Image decoding failed. Please ensure the image file is not corrupted.")
 
     if not isinstance(image, np.ndarray):
-        raise ValueError("Invalid image format")
+        raise ValueError("Invalid image format.")
 
     if image.size == 0:
-        raise ValueError("Empty image data")
+        raise ValueError("Empty image data. Please upload a valid image.")
 
     height, width = image.shape[:2]
 
     if height == 0 or width == 0:
-        raise ValueError("Image has invalid dimensions")
+        raise ValueError("Image has invalid dimensions.")
 
     if height < 200 or width < 200:
-        raise ValueError("Image resolution too small")
+        raise ValueError("Image resolution too small. Please upload an image with at least 200x200 resolution.")
 
     return True
 

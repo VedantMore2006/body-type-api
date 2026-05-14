@@ -63,7 +63,7 @@ def detect_torso_measurements(width_profile, pose_shoulder_y, pose_hip_y):
 
     height = len(width_profile)
     if height == 0:
-        raise ValueError("Invalid width profile")
+        raise ValueError("Failed to measure torso width. Ensure the person's posture is clear and they are not wearing overly baggy clothes.")
 
     torso_start = int(pose_shoulder_y)
     # Extend hip scan range ~10% below the hip joint to capture pelvic silhouette

@@ -4,7 +4,7 @@ def compute_scale(real_height, pixel_height):
     """
 
     if pixel_height == 0:
-        raise ValueError("Pixel height cannot be zero")
+        raise ValueError("Invalid pixel height computed. Ensure the full person is visible.")
 
     scale = real_height / pixel_height
 

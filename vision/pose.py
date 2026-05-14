@@ -14,7 +14,7 @@ def extract_pose_keypoints(image, pose_model):
         keypoints = r.keypoints.xy.cpu().numpy()
 
         if keypoints is None or len(keypoints) == 0:
-            raise ValueError("No pose detected")
+            raise ValueError("No pose detected in the image. Please ensure the person is clearly visible and facing the camera.")
 
         k = keypoints[0]
 
@@ -43,4 +43,4 @@ def extract_pose_keypoints(image, pose_model):
 
         return pose_data
 
-    raise ValueError("Pose extraction failed")
+    raise ValueError("Pose extraction failed. The person's posture might be unclear.")
