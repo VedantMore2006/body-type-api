@@ -1,0 +1,207 @@
+# =========================
+
+# 🔐 ENV & SECRETS
+
+# =========================
+
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.crt
+secrets.*
+config/.env
+
+# =========================
+
+# 🐍 PYTHON
+
+# =========================
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# C extensions
+
+*.so
+
+# Distribution / packaging
+
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+
+venv/
+.env/
+.venv/
+ENV/
+env/
+venv.bak/
+.venv.bak/
+
+# PyInstaller
+
+*.manifest
+*.spec
+
+# Installer logs
+
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.pytest_cache/
+
+# Type checkers
+
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# =========================
+
+# 🧠 AI / PROJECT-SPECIFIC
+
+# =========================
+
+logs/
+*.log
+
+# Runtime outputs
+
+*.out
+*.err
+
+# Temporary session/state files
+
+*.session
+*.state
+*.cache
+
+# =========================
+
+# 🖥️ OS-SPECIFIC
+
+# =========================
+
+# Linux
+
+*~
+.nfs*
+
+# macOS
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =========================
+
+# 🧰 EDITORS / IDEs
+
+# =========================
+
+# VS Code
+
+.vscode/
+
+# JetBrains (PyCharm, IntelliJ)
+
+.idea/
+*.iml
+
+# Vim
+
+*.swp
+*.swo
+
+# Emacs
+
+*~
+
+# Sublime
+
+*.sublime-project
+*.sublime-workspace
+
+# =========================
+
+# 📦 PACKAGE MANAGERS
+
+# =========================
+
+# pipenv
+
+Pipfile.lock
+
+# poetry
+
+poetry.lock
+
+# =========================
+
+# 🐳 DOCKER
+
+# =========================
+
+.dockerignore
+
+# =========================
+
+# 🔧 BUILD / MISC
+
+# =========================
+
+*.bak
+*.tmp
+*.temp
+*.orig
+
+# =========================
+
+# 📁 OPTIONAL (uncomment if needed)
+
+# =========================
+
+# Ignore test outputs
+
+# tests/output/
+
+# Ignore local configs
+
+# config/local_settings.py
